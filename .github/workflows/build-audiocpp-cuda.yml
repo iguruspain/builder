@@ -1,10 +1,8 @@
 # Repo de builds: .github/workflows/build-audiocpp-cuda.yml
 #
-# Compila 0xShug0/audio.cpp para Ubuntu x64 + CUDA 13.x sin tocar ni forkear el
-# repo original. Equivale a:
-#   scripts/build_linux.sh --backend cuda --cuda-arch <arch> --native-model-manager \
-#       --target audiocpp_cli --target audiocpp_server
-# pero llamando a cmake directamente (así no hace falta parchear el script).
+# Compila 0xShug0/audio.cpp para Ubuntu x64 + CUDA 13.x sin forkear el repo.
+# Las opciones de CMake salen del PKGBUILD audio.cpp-cuda-git (modo CI):
+# CPU_ALL_VARIANTS + NATIVE_CPU=OFF + arquitecturas CUDA explícitas.
 name: audio.cpp - Ubuntu x64 CUDA 13
 
 on:
@@ -14,7 +12,7 @@ on:
         description: 'Tag, rama o commit de 0xShug0/audio.cpp a compilar'
         default: 'main'
       cuda_arch:
-        description: 'CUDA archs (lista CMake, ej. "86" o "75;80;86;89;90;120")'
+        description: 'CUDA archs (ej. "86", "86-real" o la lista del PKGBUILD "75-virtual;80-virtual;86-real;89-real;120a-real;121a-real")'
         default: '86'
       publish_release:
         description: 'Publicar los paquetes en un Release de este repo'
@@ -29,8 +27,6 @@ env:
   UPSTREAM_REF: ${{ inputs.ref }}
   CUDA_ARCH: ${{ inputs.cuda_arch }}
   CUDA_LABEL: '13.4'
-  # Adaptadores opcionales del servidor (README: "Server Frontend Modules")
-  FRONTEND_MODULES: 'audio_decode;mp3_encode'
 
 jobs:
   build:
@@ -47,8 +43,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
-          # .gitmodules usa una URL SSH (git@github.com:...): forzar HTTPS
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
 
       - name: Clone audio.cpp
         uses: actions/checkout@v6
@@ -56,7 +50,6 @@ jobs:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ env.UPSTREAM_REF }}
           path: src
-          submodules: recursive
           fetch-depth: 0
 
       - name: Resolve version
@@ -68,21 +61,12 @@ jobs:
           echo "sha=$(git rev-parse HEAD)"            >> "$GITHUB_OUTPUT"
           echo "arch=${CUDA_ARCH//;/-}"               >> "$GITHUB_OUTPUT"
 
+      # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
       - name: Dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build patchelf python3 curl libssl-dev
-
-      # Falla pronto si el submódulo no se descargó; imprime su README para ver
-      # las dependencias propias de cada módulo (audio_decode, mp3_encode).
-      - name: Check server frontends package
-        working-directory: src
-        run: |
-          D=external/audio.cpp-server-frontends
-          test -f "$D/server_frontends.cmake" || { echo "::error::Falta $D/server_frontends.cmake (¿submódulo sin inicializar?)"; exit 1; }
-          ls "$D"
-          for f in "$D"/README*; do [ -f "$f" ] && { echo "== $f"; head -n 80 "$f"; }; done || true
+            build-essential cmake ninja-build patchelf python3 curl perl
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -91,32 +75,30 @@ jobs:
           evict-old-files: 1d
           max-size: "1G"
 
-      # Mismos valores que scripts/build_linux.sh --backend cuda, con:
-      #  Release                 el script usa RelWithDebInfo por defecto; upstream publica Release
-      #  NATIVE_CPU=OFF          sin -march=native del runner (binario portable)
-      #  DEPLOYMENT_BUILD=ON     embebe los package specs, como los binarios de upstream
-      #  USE_SYSTEM_OPENSSL=ON   igual que el job CUDA de upstream (libssl-dev)
+      # Flags del PKGBUILD (rama CI):
+      #  ENGINE_ENABLE_CPU_ALL_VARIANTS=ON  variantes de CPU elegidas en runtime
+      #       => libs ggml/backends compartidas junto a los binarios ($ORIGIN)
+      #  ENGINE_ENABLE_NATIVE_CPU=OFF       sin -march=native del runner
+      #  GGML_CUDA_FA_ALL_QUANTS=ON         FlashAttention para todas las cuantizaciones
+      #       (compila bastante más lento y pesa más)
+      #  CMAKE_CUDA_ARCHITECTURES           explícito: el runner no tiene GPU
+      # Diferencia respecto al PKGBUILD:
+      #  GGML_CUDA_NCCL=OFF  en Arch no hay NCCL instalado, así que no se enlaza;
+      #       este contenedor sí lo trae y acabaría como dependencia (solo sirve multi-GPU)
       - name: Configure
         working-directory: src
         run: |
           cmake -S . -B build/linux-cuda-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DENGINE_ENABLE_CUDA=ON \
-            -DENGINE_ENABLE_CUDA_GRAPHS=ON \
-            -DENGINE_ENABLE_VULKAN=OFF \
             -DENGINE_ENABLE_HIP=OFF \
-            -DENGINE_ENABLE_NATIVE_CPU=OFF \
-            -DENGINE_ENABLE_LLAMAFILE=ON \
-            -DENGINE_BUILD_EXAMPLES=OFF \
-            -DENGINE_BUILD_TESTS=OFF \
-            -DENGINE_BUILD_WARMBENCH=OFF \
+            -DENGINE_ENABLE_VULKAN=OFF \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_CUDA_NCCL=OFF \
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
             -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON \
-            -DAUDIOCPP_USE_SYSTEM_OPENSSL=ON \
-            -DAUDIOCPP_MODEL_SET=full \
-            -DAUDIOCPP_BUILD_SERVER_FRONTENDS=ON \
-            -DAUDIOCPP_SERVER_FRONTENDS_DIR=external/audio.cpp-server-frontends \
-            -DAUDIOCPP_SERVER_FRONTEND_MODULES="${FRONTEND_MODULES}" \
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -126,7 +108,7 @@ jobs:
         working-directory: src
         run: |
           cmake --build build/linux-cuda-release --parallel "$(nproc)" \
-            --target audiocpp_cli --target audiocpp_server
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
 
       - name: Pack artifacts
         id: pack
@@ -135,53 +117,74 @@ jobs:
           set -euo pipefail
           CLI=$(find build -type f -name audiocpp_cli | head -n1)
           BIN_DIR=$(dirname "$CLI")
-          SUFFIX="${{ steps.ver.outputs.name }}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${{ steps.ver.outputs.arch }}"
-          BASE="audio-${SUFFIX}"
-          RT="audio-${{ steps.ver.outputs.name }}-cudart-ubuntu-x64-cuda${CUDA_LABEL}-sm${{ steps.ver.outputs.arch }}"
-          rm -rf /tmp/pkg /tmp/cudart && mkdir -p "/tmp/pkg/$BASE" "/tmp/cudart/$RT"
+          NAME="${{ steps.ver.outputs.name }}"
+          SM="${{ steps.ver.outputs.arch }}"
+          BASE="audio-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
+          RT="audio-${NAME}-cudart-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
+          PKG="/tmp/pkg/$BASE"
+          RTD="/tmp/cudart/$RT"
+          rm -rf /tmp/pkg /tmp/cudart && mkdir -p "$PKG" "$RTD"
 
-          for b in audiocpp_cli audiocpp_server audiocpp_model_manager; do
-            if [ -f "$BIN_DIR/$b" ]; then cp "$BIN_DIR/$b" "/tmp/pkg/$BASE/"; fi
+          for b in audiocpp_cli audiocpp_server audiocpp_gguf audiocpp_model_manager; do
+            if [ -f "$BIN_DIR/$b" ]; then cp "$BIN_DIR/$b" "$PKG/"; fi
           done
-          cp "$BIN_DIR"/*.so* "/tmp/pkg/$BASE/" 2>/dev/null || true
+          # Libs privadas de la build (ggml, backend CUDA, variantes de CPU...):
+          # en el mismo directorio que los binarios, como hace el PKGBUILD.
+          if compgen -G "$BIN_DIR/*.so*" > /dev/null; then
+            cp -a "$BIN_DIR"/*.so* "$PKG/"
+          fi
 
-          # mismo contenido que el bundle de upstream
-          cp LICENSE "/tmp/pkg/$BASE/" || true
-          cp -r tools       "/tmp/pkg/$BASE/tools"       || true
-          cp -r model_specs "/tmp/pkg/$BASE/model_specs" || true
+          # mismo contenido que el bundle de upstream / PKGBUILD
+          cp LICENSE "$PKG/" || true
+          cp -r tools       "$PKG/tools"       || true
+          cp -r model_specs "$PKG/model_specs" || true
 
-          # Runtime CUDA: solo lo que enlazan los binarios (cudart, cublas,
-          # cublasLt y cufft). cp -L deja ficheros planos. libcuda.so.1 lo
-          # aporta el driver.
-          for b in audiocpp_cli audiocpp_server; do
-            [ -f "/tmp/pkg/$BASE/$b" ] || continue
-            ldd "/tmp/pkg/$BASE/$b" | awk '/=> \//{print $3}' \
+          echo "Contenido del paquete:"; ls -lh "$PKG"
+
+          # Runtime CUDA: lo enlazan los binarios Y las libs (libggml-cuda.so,
+          # que es lo que depende de cudart/cublas). cp -L deja ficheros planos.
+          # libcuda.so.1 NO se incluye: lo aporta el driver.
+          for f in "$PKG"/audiocpp_* "$PKG"/*.so*; do
+            [ -f "$f" ] || continue
+            ldd "$f" 2>/dev/null | awk '/=> \//{print $3}' \
               | grep -E '/lib(cudart|cublas|cublasLt|cufft)\.so' \
-              | xargs -r -I{} cp -L -n {} "/tmp/cudart/$RT/" || true
+              | xargs -r -I{} cp -L -n {} "$RTD/" || true
           done
-          echo "Runtime libs:"; ls -l "/tmp/cudart/$RT"
-          if ! ls "/tmp/cudart/$RT" | grep -q '^libcudart'; then
-            echo "::error::No se encontró libcudart entre las dependencias de los binarios"
+          echo "Runtime libs:"; ls -l "$RTD"
+          if ! ls "$RTD" | grep -q '^libcudart'; then
+            echo "::error::No se encontró libcudart entre las dependencias de binarios/libs"
             exit 1
           fi
 
-          # RPATH=$ORIGIN: las libs de cudart se extraen junto a los binarios
-          for f in "/tmp/pkg/$BASE"/audiocpp_* "/tmp/cudart/$RT"/*.so*; do
+          # RPATH=$ORIGIN: todo se resuelve en el mismo directorio
+          for f in "$PKG"/audiocpp_* "$PKG"/*.so* "$RTD"/*.so*; do
             [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" || true
           done
 
-          # Verificación: con bin + cudart juntos no debe faltar nada salvo
-          # libcuda.so.1 (driver).
+          # Verificación sobre binarios Y libs, con bin + cudart juntos:
+          # solo se admite que falte libcuda.so.1 (driver).
           rm -rf /tmp/verify && mkdir /tmp/verify
-          cp "/tmp/pkg/$BASE"/audiocpp_* /tmp/verify/
-          cp "/tmp/cudart/$RT"/*.so* /tmp/verify/
-          for b in audiocpp_cli audiocpp_server; do
-            ldd "/tmp/verify/$b" | tee "/tmp/$b.ldd"
-            if ! awk '/libcuda\.so\.1/ && /not found/ { next } /not found/ { print; bad=1 } END { exit bad ? 1 : 0 }' "/tmp/$b.ldd"; then
-              echo "::error::$b tiene dependencias sin resolver"
-              exit 1
-            fi
+          cp -a "$PKG"/audiocpp_* /tmp/verify/
+          cp -a "$PKG"/*.so* /tmp/verify/ 2>/dev/null || true
+          cp -a "$RTD"/*.so* /tmp/verify/
+          : > /tmp/all.ldd
+          for f in /tmp/verify/audiocpp_* /tmp/verify/*.so*; do
+            [ -f "$f" ] || continue
+            echo "== $(basename "$f")" >> /tmp/all.ldd
+            ldd "$f" >> /tmp/all.ldd 2>&1 || true
           done
+          cat /tmp/all.ldd
+          if grep 'not found' /tmp/all.ldd | grep -qv 'libcuda\.so\.1'; then
+            echo "::error::hay dependencias sin resolver"
+            grep 'not found' /tmp/all.ldd | grep -v 'libcuda\.so\.1'
+            exit 1
+          fi
+          # NCCL sí está instalado en el contenedor, así que el ldd no lo marcaría
+          # como faltante: comprobarlo explícitamente.
+          if grep -q 'libnccl' /tmp/all.ldd; then
+            echo "::error::algún binario/lib enlaza libnccl (no se empaqueta)"
+            exit 1
+          fi
 
           tar -C /tmp/pkg    -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$BASE"
           tar -C /tmp/cudart -czf "$GITHUB_WORKSPACE/$RT.tar.gz"   "$RT"
