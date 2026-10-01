@@ -125,7 +125,7 @@ jobs:
           mkdir -p "$BUNDLE_DIR"
 
           # Binarios principales
-          cp "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin" "$BUNDLE_DIR/"
+          cp -r "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin" "$BUNDLE_DIR/"
           
           # Recursos asociados
           cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
