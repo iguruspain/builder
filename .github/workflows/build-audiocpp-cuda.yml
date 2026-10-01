@@ -119,11 +119,11 @@ jobs:
           SM="${{ steps.ver.outputs.arch }}"
           BASE="audio-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
 
-          cp LICENSE build/bin/ 2>/dev/null || true
-          cp -r tools build/bin/tools 2>/dev/null || true
-          cp -r model_specs build/bin/model_specs 2>/dev/null || true
+          cp LICENSE build/linux-cuda-release/bin/ 2>/dev/null || true
+          cp -r tools build/linux-cuda-release/bin/tools 2>/dev/null || true
+          cp -r model_specs build/linux-cuda-release/bin/model_specs 2>/dev/null || true
 
-          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$GITHUB_WORKSPACE/build/bin"
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$GITHUB_WORKSPACE/build/linux-cuda-release/bin"
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
           
       - name: Upload artifacts
