@@ -1,0 +1,214 @@
+# Repo de builds: .github/workflows/build-audiocpp-cuda.yml
+#
+# Compila 0xShug0/audio.cpp para Ubuntu x64 + CUDA 13.x sin tocar ni forkear el
+# repo original. Equivale a:
+#   scripts/build_linux.sh --backend cuda --cuda-arch <arch> --native-model-manager \
+#       --target audiocpp_cli --target audiocpp_server
+# pero llamando a cmake directamente (así no hace falta parchear el script).
+name: audio.cpp - Ubuntu x64 CUDA 13
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag, rama o commit de 0xShug0/audio.cpp a compilar'
+        default: 'main'
+      cuda_arch:
+        description: 'CUDA archs (lista CMake, ej. "86" o "75;80;86;89;90;120")'
+        default: '86'
+      publish_release:
+        description: 'Publicar los paquetes en un Release de este repo'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # crear Release en ESTE repo
+
+env:
+  UPSTREAM_REPO: 0xShug0/audio.cpp
+  UPSTREAM_REF: ${{ inputs.ref }}
+  CUDA_ARCH: ${{ inputs.cuda_arch }}
+  CUDA_LABEL: '13.4'
+  # Adaptadores opcionales del servidor (README: "Server Frontend Modules")
+  FRONTEND_MODULES: 'audio_decode;mp3_encode'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.4.1-devel-ubuntu24.04   # misma imagen que usa llama.cpp
+
+    defaults:
+      run:
+        shell: bash   # los jobs en contenedor usan dash por defecto
+
+    steps:
+      # el contenedor no trae git: instalarlo antes del checkout
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          # .gitmodules usa una URL SSH (git@github.com:...): forzar HTTPS
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Clone audio.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
+          cd src
+          echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)"            >> "$GITHUB_OUTPUT"
+          echo "arch=${CUDA_ARCH//;/-}"               >> "$GITHUB_OUTPUT"
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build patchelf python3 curl libssl-dev
+
+      # Falla pronto si el submódulo no se descargó; imprime su README para ver
+      # las dependencias propias de cada módulo (audio_decode, mp3_encode).
+      - name: Check server frontends package
+        working-directory: src
+        run: |
+          D=external/audio.cpp-server-frontends
+          test -f "$D/server_frontends.cmake" || { echo "::error::Falta $D/server_frontends.cmake (¿submódulo sin inicializar?)"; exit 1; }
+          ls "$D"
+          for f in "$D"/README*; do [ -f "$f" ] && { echo "== $f"; head -n 80 "$f"; }; done || true
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_LABEL }}
+          evict-old-files: 1d
+          max-size: "1G"
+
+      # Mismos valores que scripts/build_linux.sh --backend cuda, con:
+      #  Release                 el script usa RelWithDebInfo por defecto; upstream publica Release
+      #  NATIVE_CPU=OFF          sin -march=native del runner (binario portable)
+      #  DEPLOYMENT_BUILD=ON     embebe los package specs, como los binarios de upstream
+      #  USE_SYSTEM_OPENSSL=ON   igual que el job CUDA de upstream (libssl-dev)
+      - name: Configure
+        working-directory: src
+        run: |
+          cmake -S . -B build/linux-cuda-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENGINE_ENABLE_CUDA=ON \
+            -DENGINE_ENABLE_CUDA_GRAPHS=ON \
+            -DENGINE_ENABLE_VULKAN=OFF \
+            -DENGINE_ENABLE_HIP=OFF \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
+            -DENGINE_ENABLE_LLAMAFILE=ON \
+            -DENGINE_BUILD_EXAMPLES=OFF \
+            -DENGINE_BUILD_TESTS=OFF \
+            -DENGINE_BUILD_WARMBENCH=OFF \
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
+            -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON \
+            -DAUDIOCPP_USE_SYSTEM_OPENSSL=ON \
+            -DAUDIOCPP_MODEL_SET=full \
+            -DAUDIOCPP_BUILD_SERVER_FRONTENDS=ON \
+            -DAUDIOCPP_SERVER_FRONTENDS_DIR=external/audio.cpp-server-frontends \
+            -DAUDIOCPP_SERVER_FRONTEND_MODULES="${FRONTEND_MODULES}" \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build/linux-cuda-release --parallel "$(nproc)" \
+            --target audiocpp_cli --target audiocpp_server
+
+      - name: Pack artifacts
+        id: pack
+        working-directory: src
+        run: |
+          set -euo pipefail
+          CLI=$(find build -type f -name audiocpp_cli | head -n1)
+          BIN_DIR=$(dirname "$CLI")
+          SUFFIX="${{ steps.ver.outputs.name }}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${{ steps.ver.outputs.arch }}"
+          BASE="audio-${SUFFIX}"
+          RT="audio-${{ steps.ver.outputs.name }}-cudart-ubuntu-x64-cuda${CUDA_LABEL}-sm${{ steps.ver.outputs.arch }}"
+          rm -rf /tmp/pkg /tmp/cudart && mkdir -p "/tmp/pkg/$BASE" "/tmp/cudart/$RT"
+
+          for b in audiocpp_cli audiocpp_server audiocpp_model_manager; do
+            if [ -f "$BIN_DIR/$b" ]; then cp "$BIN_DIR/$b" "/tmp/pkg/$BASE/"; fi
+          done
+          cp "$BIN_DIR"/*.so* "/tmp/pkg/$BASE/" 2>/dev/null || true
+
+          # mismo contenido que el bundle de upstream
+          cp LICENSE "/tmp/pkg/$BASE/" || true
+          cp -r tools       "/tmp/pkg/$BASE/tools"       || true
+          cp -r model_specs "/tmp/pkg/$BASE/model_specs" || true
+
+          # Runtime CUDA: solo lo que enlazan los binarios (cudart, cublas,
+          # cublasLt y cufft). cp -L deja ficheros planos. libcuda.so.1 lo
+          # aporta el driver.
+          for b in audiocpp_cli audiocpp_server; do
+            [ -f "/tmp/pkg/$BASE/$b" ] || continue
+            ldd "/tmp/pkg/$BASE/$b" | awk '/=> \//{print $3}' \
+              | grep -E '/lib(cudart|cublas|cublasLt|cufft)\.so' \
+              | xargs -r -I{} cp -L -n {} "/tmp/cudart/$RT/" || true
+          done
+          echo "Runtime libs:"; ls -l "/tmp/cudart/$RT"
+          if ! ls "/tmp/cudart/$RT" | grep -q '^libcudart'; then
+            echo "::error::No se encontró libcudart entre las dependencias de los binarios"
+            exit 1
+          fi
+
+          # RPATH=$ORIGIN: las libs de cudart se extraen junto a los binarios
+          for f in "/tmp/pkg/$BASE"/audiocpp_* "/tmp/cudart/$RT"/*.so*; do
+            [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" || true
+          done
+
+          # Verificación: con bin + cudart juntos no debe faltar nada salvo
+          # libcuda.so.1 (driver).
+          rm -rf /tmp/verify && mkdir /tmp/verify
+          cp "/tmp/pkg/$BASE"/audiocpp_* /tmp/verify/
+          cp "/tmp/cudart/$RT"/*.so* /tmp/verify/
+          for b in audiocpp_cli audiocpp_server; do
+            ldd "/tmp/verify/$b" | tee "/tmp/$b.ldd"
+            if ! awk '/libcuda\.so\.1/ && /not found/ { next } /not found/ { print; bad=1 } END { exit bad ? 1 : 0 }' "/tmp/$b.ldd"; then
+              echo "::error::$b tiene dependencias sin resolver"
+              exit 1
+            fi
+          done
+
+          tar -C /tmp/pkg    -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$BASE"
+          tar -C /tmp/cudart -czf "$GITHUB_WORKSPACE/$RT.tar.gz"   "$RT"
+          echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "rt=$RT.tar.gz"    >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.bin }}
+          path: ${{ steps.pack.outputs.bin }}
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.rt }}
+          path: ${{ steps.pack.outputs.rt }}
+
+      - name: Release
+        if: inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: audiocpp-${{ steps.ver.outputs.name }}-cuda${{ env.CUDA_LABEL }}
+          name: audio.cpp ${{ steps.ver.outputs.name }} (Ubuntu x64, CUDA ${{ env.CUDA_LABEL }})
+          body: |
+            Build de https://github.com/${{ env.UPSTREAM_REPO }} en el commit `${{ steps.ver.outputs.sha }}`.
+            CUDA archs: `${{ env.CUDA_ARCH }}`. Extrae el paquete `bin` y el `cudart` en la misma carpeta.
+          files: |
+            ${{ steps.pack.outputs.bin }}
+            ${{ steps.pack.outputs.rt }}
