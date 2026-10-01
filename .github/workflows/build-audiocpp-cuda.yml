@@ -58,8 +58,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
           cd src
           echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)"            >> "$GITHUB_OUTPUT"
-          echo "arch=${CUDA_ARCH//;/-}"               >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
 
       # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
       - name: Dependencies
@@ -110,28 +110,43 @@ jobs:
           cmake --build build/linux-cuda-release --parallel "$(nproc)" \
             --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
 
+      # Empaquetado limpio: solo binarios + recursos que se usan en la misma carpeta.
+      # No se incluye el árbol completo de bin/ porque ahí aparecen .so y symlinks de runtime.
       - name: Stage bundle
         id: pack
-        working-directory: src
         run: |
           set -euo pipefail
           NAME="${{ steps.ver.outputs.name }}"
           SM="${{ steps.ver.outputs.arch }}"
           BASE="audio-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
 
-          cp LICENSE build/linux-cuda-release/bin/ 2>/dev/null || true
-          cp -r tools build/linux-cuda-release/bin/tools 2>/dev/null || true
-          cp -r model_specs build/linux-cuda-release/bin/model_specs 2>/dev/null || true
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR"
 
-          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$GITHUB_WORKSPACE/src/build/linux-cuda-release" bin
+          # Binarios principales
+          cp "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin/audiocpp_cli" "$BUNDLE_DIR/"
+          cp "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin/audiocpp_server" "$BUNDLE_DIR/"
+          cp "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin/audiocpp_gguf" "$BUNDLE_DIR/"
+
+          # Recursos asociados
+          cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/tools" "$BUNDLE_DIR/tools" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/model_specs" "$BUNDLE_DIR/model_specs" 2>/dev/null || true
+
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
-          
+
+      # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
+      # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack.outputs.bin }}
           path: ${{ steps.pack.outputs.bin }}
-          
+          if-no-files-found: error
+
       - name: Release
         if: inputs.publish_release
         uses: softprops/action-gh-release@v2
@@ -141,5 +156,6 @@ jobs:
           body: |
             Build de https://github.com/${{ env.UPSTREAM_REPO }} en el commit `${{ steps.ver.outputs.sha }}`.
             CUDA archs: `${{ env.CUDA_ARCH }}`.
+            El paquete es un tar.gz con la estructura esperada en la raíz: binarios, tools/, model_specs/ y LICENSE.
           files: |
-            ${{ steps.pack.outputs.bin }}
+            ${{ github.workspace }}/${{ steps.pack.outputs.bin }}
