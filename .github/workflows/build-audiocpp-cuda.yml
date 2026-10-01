@@ -123,7 +123,7 @@ jobs:
           cp -r tools build/linux-cuda-release/bin/tools 2>/dev/null || true
           cp -r model_specs build/linux-cuda-release/bin/model_specs 2>/dev/null || true
 
-          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$GITHUB_WORKSPACE/build/linux-cuda-release/bin"
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$GITHUB_WORKSPACE/src/build/linux-cuda-release" bin
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
           
       - name: Upload artifacts
@@ -140,6 +140,6 @@ jobs:
           name: audio.cpp ${{ steps.ver.outputs.name }} (Ubuntu x64, CUDA ${{ env.CUDA_LABEL }})
           body: |
             Build de https://github.com/${{ env.UPSTREAM_REPO }} en el commit `${{ steps.ver.outputs.sha }}`.
-            CUDA archs: `${{ env.CUDA_ARCH }}`. Extrae el paquete `bin` y el `cudart` en la misma carpeta.
+            CUDA archs: `${{ env.CUDA_ARCH }}`.
           files: |
             ${{ steps.pack.outputs.bin }}
