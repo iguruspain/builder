@@ -118,7 +118,7 @@ jobs:
           set -euo pipefail
           NAME="${{ steps.ver.outputs.name }}"
           SM="${{ steps.ver.outputs.arch }}"
-          BASE="audio-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
+          BASE="audiocpp-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
 
           BUNDLE_DIR="/tmp/audiocpp-bundle"
           rm -rf "$BUNDLE_DIR"

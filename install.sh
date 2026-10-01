@@ -35,11 +35,11 @@ fi
 release_json="$(curl -fsSL "${CURL_AUTH[@]}" "$API_URL")"
 
 asset_name="$(jq -r '
-    [.assets[] | select(.name | test("^audio-.*\\.tar\\.gz$"))] | first | .name // empty
+    [.assets[] | select(.name | test("^audiocpp-.*\\.tar\\.gz$"))] | first | .name // empty
 ' <<<"$release_json")"
 
 if [[ -z "${asset_name}" ]]; then
-    err "No se encontró ningún asset 'audio-*.tar.gz' en la última release."
+    err "No se encontró ningún asset 'audiocpp-*.tar.gz' en la última release."
     exit 1
 fi
 
