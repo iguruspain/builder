@@ -18,14 +18,16 @@ on:
         description: 'Publicar los paquetes en un Release de este repo'
         type: boolean
         default: false
-
+  schedule:
+    - cron: '21 3 * * *'   # UTC 03:21, diario
+    
 permissions:
   contents: write   # crear Release en ESTE repo
 
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
-  UPSTREAM_REF: ${{ inputs.ref }}
-  CUDA_ARCH: ${{ inputs.cuda_arch }}
+  UPSTREAM_REF: ${{ inputs.ref || 'main' }}
+  CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
   CUDA_LABEL: '13.4'
 
 jobs:
@@ -60,6 +62,11 @@ jobs:
           echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            git log -1 --pretty=format:'%s%n%n%b'
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
       - name: Dependencies
@@ -116,9 +123,10 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          NAME="${{ steps.ver.outputs.name }}"
+          # NAME="${{ steps.ver.outputs.name }}"
+          DATETIME="$(date -u +%Y%m%d%H%M%S)"
           SM="${{ steps.ver.outputs.arch }}"
-          BASE="audiocpp-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
+          BASE="audiocpp-${DATETIME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
 
           BUNDLE_DIR="/tmp/audiocpp-bundle"
           rm -rf "$BUNDLE_DIR"
@@ -134,6 +142,7 @@ jobs:
 
           tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "datetime=$DATETIME" >> "$GITHUB_OUTPUT"
 
       # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
       # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
@@ -146,14 +155,16 @@ jobs:
           if-no-files-found: error
 
       - name: Release
-        if: inputs.publish_release
+        if: ${{ inputs.publish_release || github.event_name == 'schedule' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: audiocpp-${{ steps.ver.outputs.name }}-cuda${{ env.CUDA_LABEL }}
+          tag_name: audiocpp-${{ steps.ver.outputs.name }}-cuda${{ env.CUDA_LABEL }}-${{ steps.pack.outputs.datetime }}
           name: audio.cpp ${{ steps.ver.outputs.name }} (Ubuntu x64, CUDA ${{ env.CUDA_LABEL }})
           body: |
             Build de https://github.com/${{ env.UPSTREAM_REPO }} en el commit `${{ steps.ver.outputs.sha }}`.
             CUDA archs: `${{ env.CUDA_ARCH }}`.
+            Descripción de la release:
+              ${{ steps.ver.outputs.changelog }}
             El paquete es un tar.gz con la estructura esperada en la raíz: binarios, tools/, model_specs/ y LICENSE.
           files: |
             ${{ github.workspace }}/${{ steps.pack.outputs.bin }}
