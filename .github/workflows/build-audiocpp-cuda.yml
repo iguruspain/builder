@@ -110,99 +110,28 @@ jobs:
           cmake --build build/linux-cuda-release --parallel "$(nproc)" \
             --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
 
-      - name: Pack artifacts
+      - name: Stage bundle
         id: pack
         working-directory: src
         run: |
           set -euo pipefail
-          CLI=$(find build -type f -name audiocpp_cli | head -n1)
-          BIN_DIR=$(dirname "$CLI")
           NAME="${{ steps.ver.outputs.name }}"
           SM="${{ steps.ver.outputs.arch }}"
           BASE="audio-${NAME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
-          RT="audio-${NAME}-cudart-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
-          PKG="/tmp/pkg/$BASE"
-          RTD="/tmp/cudart/$RT"
-          rm -rf /tmp/pkg /tmp/cudart && mkdir -p "$PKG" "$RTD"
 
-          for b in audiocpp_cli audiocpp_server audiocpp_gguf audiocpp_model_manager; do
-            if [ -f "$BIN_DIR/$b" ]; then cp "$BIN_DIR/$b" "$PKG/"; fi
-          done
-          # Libs privadas de la build (ggml, backend CUDA, variantes de CPU...):
-          # en el mismo directorio que los binarios, como hace el PKGBUILD.
-          if compgen -G "$BIN_DIR/*.so*" > /dev/null; then
-            cp -a "$BIN_DIR"/*.so* "$PKG/"
-          fi
+          cp LICENSE build/bin/ 2>/dev/null || true
+          cp -r tools build/bin/tools 2>/dev/null || true
+          cp -r model_specs build/bin/model_specs 2>/dev/null || true
 
-          # mismo contenido que el bundle de upstream / PKGBUILD
-          cp LICENSE "$PKG/" || true
-          cp -r tools       "$PKG/tools"       || true
-          cp -r model_specs "$PKG/model_specs" || true
-
-          echo "Contenido del paquete:"; ls -lh "$PKG"
-
-          # Runtime CUDA: lo enlazan los binarios Y las libs (libggml-cuda.so,
-          # que es lo que depende de cudart/cublas). cp -L deja ficheros planos.
-          # libcuda.so.1 NO se incluye: lo aporta el driver.
-          for f in "$PKG"/audiocpp_* "$PKG"/*.so*; do
-            [ -f "$f" ] || continue
-            ldd "$f" 2>/dev/null | awk '/=> \//{print $3}' \
-              | grep -E '/lib(cudart|cublas|cublasLt|cufft)\.so' \
-              | xargs -r -I{} cp -L -n {} "$RTD/" || true
-          done
-          echo "Runtime libs:"; ls -l "$RTD"
-          if ! ls "$RTD" | grep -q '^libcudart'; then
-            echo "::error::No se encontró libcudart entre las dependencias de binarios/libs"
-            exit 1
-          fi
-
-          # RPATH=$ORIGIN: todo se resuelve en el mismo directorio
-          for f in "$PKG"/audiocpp_* "$PKG"/*.so* "$RTD"/*.so*; do
-            [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" || true
-          done
-
-          # Verificación sobre binarios Y libs, con bin + cudart juntos:
-          # solo se admite que falte libcuda.so.1 (driver).
-          rm -rf /tmp/verify && mkdir /tmp/verify
-          cp -a "$PKG"/audiocpp_* /tmp/verify/
-          cp -a "$PKG"/*.so* /tmp/verify/ 2>/dev/null || true
-          cp -a "$RTD"/*.so* /tmp/verify/
-          : > /tmp/all.ldd
-          for f in /tmp/verify/audiocpp_* /tmp/verify/*.so*; do
-            [ -f "$f" ] || continue
-            echo "== $(basename "$f")" >> /tmp/all.ldd
-            ldd "$f" >> /tmp/all.ldd 2>&1 || true
-          done
-          cat /tmp/all.ldd
-          if grep 'not found' /tmp/all.ldd | grep -qv 'libcuda\.so\.1'; then
-            echo "::error::hay dependencias sin resolver"
-            grep 'not found' /tmp/all.ldd | grep -v 'libcuda\.so\.1'
-            exit 1
-          fi
-          # NCCL sí está instalado en el contenedor, así que el ldd no lo marcaría
-          # como faltante: comprobarlo explícitamente.
-          if grep -q 'libnccl' /tmp/all.ldd; then
-            echo "::error::algún binario/lib enlaza libnccl (no se empaqueta)"
-            exit 1
-          fi
-
-          tar -C /tmp/pkg    -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$BASE"
-          tar -C /tmp/cudart -czf "$GITHUB_WORKSPACE/$RT.tar.gz"   "$RT"
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" "$GITHUB_WORKSPACE/build/bin"
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "rt=$RT.tar.gz"    >> "$GITHUB_OUTPUT"
-
+          
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack.outputs.bin }}
           path: ${{ steps.pack.outputs.bin }}
-
-      - name: Upload CUDA runtime
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ steps.pack.outputs.rt }}
-          path: ${{ steps.pack.outputs.rt }}
-
+          
       - name: Release
         if: inputs.publish_release
         uses: softprops/action-gh-release@v2
@@ -214,4 +143,3 @@ jobs:
             CUDA archs: `${{ env.CUDA_ARCH }}`. Extrae el paquete `bin` y el `cudart` en la misma carpeta.
           files: |
             ${{ steps.pack.outputs.bin }}
-            ${{ steps.pack.outputs.rt }}
