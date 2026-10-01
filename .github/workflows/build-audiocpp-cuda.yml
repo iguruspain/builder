@@ -62,10 +62,11 @@ jobs:
           echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
+          DELIM="EOF_$(openssl rand -hex 8 2>/dev/null || date +%s%N)"
           {
-            echo "changelog<<CHANGELOG_EOF"
-            git log -1 --pretty=format:'%s%n%n%b'
-            echo "CHANGELOG_EOF"
+            echo "changelog<<${DELIM}"
+            git log -1 --pretty=tformat:'%s%n%n%b'
+            echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
       # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
@@ -147,7 +148,7 @@ jobs:
       # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
       # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
       - name: Upload artifacts
-        if: always()
+        if: ${{ always() && steps.pack.outputs.bin != '' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack.outputs.bin }}
