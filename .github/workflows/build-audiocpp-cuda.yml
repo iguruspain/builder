@@ -9,20 +9,25 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Tag, rama o commit de 0xShug0/audio.cpp a compilar'
+        description: 'Tag, branch or commit from 0xShug0/audio.cpp to build (default: main)'
         default: 'main'
       cuda_arch:
-        description: 'CUDA archs (ej. "86", "86-real" o la lista del PKGBUILD "75-virtual;80-virtual;86-real;89-real;120a-real;121a-real")'
-        default: '86'
+        description: 'CUDA archs (ej. "75;80;86;89;90;120")'
+        default: '86' #RTX 30xx
       publish_release:
-        description: 'Publicar los paquetes en un Release de este repo'
+        description: 'Publish a GitHub Release with the build (default: false)'
         type: boolean
         default: false
   schedule:
-    - cron: '21 3 * * *'   # UTC 03:21, diario
-    
+    - cron: '0 7 * * *' # Hora UTC: 7:00
+
 permissions:
   contents: write   # crear Release en ESTE repo
+
+# Evita que dos builds (p. ej. manual + programado) se pisen
+concurrency:
+  group: audiocpp-build
+  cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
@@ -31,7 +36,45 @@ env:
   CUDA_LABEL: '13.4'
 
 jobs:
+  # Job ligero (sin contenedor): resuelve el commit de upstream y decide si hay algo nuevo.
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.c.outputs.sha }}
+      prev_sha: ${{ steps.c.outputs.prev_sha }}
+      should_build: ${{ steps.c.outputs.should_build }}
+    steps:
+      - name: Check upstream
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_REF}" --jq .sha)"
+
+          # El Release anterior guarda su commit en el cuerpo: primer SHA de 40 hex
+          BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].body // ""' 2>/dev/null || true)"
+          PREV="$(grep -oE '[0-9a-f]{40}' <<<"$BODY" | head -1 || true)"
+
+          SHOULD=true
+          # Solo en ejecuciones programadas: si upstream no cambió, no se recompila
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$SHA" = "$PREV" ]; then
+            SHOULD=false
+          fi
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "prev_sha=$PREV" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Check upstream"
+            echo "- Commit actual: \`$SHA\`"
+            echo "- Commit del último release: \`${PREV:-ninguno}\`"
+            echo "- Compilar: **$SHOULD**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     container: nvidia/cuda:13.4.1-devel-ubuntu24.04   # misma imagen que usa llama.cpp
 
@@ -46,11 +89,12 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
+      # Se compila exactamente el commit resuelto en el job "check"
       - name: Clone audio.cpp
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_REF }}
+          ref: ${{ needs.check.outputs.sha }}
           path: src
           fetch-depth: 0
 
@@ -59,15 +103,11 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
           cd src
+          SHA="$(git rev-parse HEAD)"
           echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
-          DELIM="EOF_$(openssl rand -hex 8 2>/dev/null || date +%s%N)"
-          {
-            echo "changelog<<${DELIM}"
-            git log -1 --pretty=tformat:'%s%n%n%b'
-            echo "${DELIM}"
-          } >> "$GITHUB_OUTPUT"
 
       # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
       - name: Dependencies
@@ -75,6 +115,94 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build patchelf python3 curl perl
+
+      # Release notes en Markdown (estilo OptiScaler): lista de commits con enlace,
+      # autor y cuerpo en cita. Se guarda en un fichero para usarlo con body_path.
+      - name: Generate release notes
+        env:
+          SHA: ${{ steps.ver.outputs.sha }}
+          VERSION: ${{ steps.ver.outputs.name }}
+          PREV_SHA: ${{ needs.check.outputs.prev_sha }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+
+          def git(*args):
+              return subprocess.run(["git", *args], cwd="src", capture_output=True, text=True)
+
+          repo = os.environ["UPSTREAM_REPO"]
+          sha = os.environ["SHA"]
+          prev = os.environ.get("PREV_SHA", "")
+          version = os.environ["VERSION"]
+          arch = os.environ["CUDA_ARCH"]
+          label = os.environ["CUDA_LABEL"]
+          url = f"https://github.com/{repo}"
+
+          same = bool(prev) and prev == sha
+          in_range = (
+              bool(prev) and not same
+              and git("merge-base", "--is-ancestor", prev, sha).returncode == 0
+          )
+
+          if same:
+              rev, scope = None, "Sin cambios de código desde el build anterior (recompilación)."
+          elif in_range:
+              rev = [f"{prev}..{sha}"]
+              scope = (f"### Cambios desde el build anterior "
+                       f"([`{prev[:7]}`...`{sha[:7]}`]({url}/compare/{prev[:7]}...{sha[:7]}))")
+          else:
+              rev = ["--since=1 day ago", sha]
+              scope = "### Cambios en las últimas 24 horas"
+
+          lines = [
+              f"**Upstream:** [{repo}]({url}) @ [`{sha[:7]}`]({url}/commit/{sha}) (`{version}`)  ",
+              f"**Commit completo:** `{sha}`  ",
+              f"**CUDA:** {label} · archs `{arch}`  ",
+              f"**Plataforma:** Ubuntu 24.04 x64",
+              "",
+              scope,
+              "",
+          ]
+
+          if rev:
+              total = int(git("rev-list", "--count", "--no-merges", *rev).stdout.strip() or 0)
+              out = git("log", "--no-merges", "-n", "30",
+                        "--format=%h%x1f%H%x1f%s%x1f%b%x1f%an%x1e", *rev).stdout
+              entries = []
+              for rec in out.split("\x1e"):
+                  rec = rec.strip()
+                  if not rec:
+                      continue
+                  p = rec.split("\x1f")
+                  if len(p) < 5:
+                      continue
+                  short, full, subject, body, author = (x.strip() for x in p[:5])
+                  e = f"- [{short}]({url}/commit/{full}) {subject} ({author})"
+                  body_lines = [l.strip() for l in body.splitlines() if l.strip()]
+                  if body_lines:
+                      shown = body_lines[:6]
+                      if len(body_lines) > 6:
+                          shown.append("…")
+                      e += "\n" + "\n".join(f"  > {l}" for l in shown)
+                  entries.append(e)
+              if entries:
+                  lines.append("\n\n".join(entries))
+                  if total > len(entries):
+                      lines += ["", f"_…y {total - len(entries)} commits más._"]
+              else:
+                  lines.append("Sin commits nuevos en el rango.")
+
+          lines += [
+              "",
+              "---",
+              "El paquete es un `tar.gz` con binarios en la raíz, `tools/`, `model_specs/` y `LICENSE`.",
+          ]
+
+          with open("release_notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+          echo "----- release_notes.md -----"
+          cat release_notes.md
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -124,8 +252,8 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          # NAME="${{ steps.ver.outputs.name }}"
           DATETIME="$(date -u +%Y%m%d%H%M%S)"
+          DAY="$(date -u +%Y-%m-%d)"
           SM="${{ steps.ver.outputs.arch }}"
           BASE="audiocpp-${DATETIME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
 
@@ -135,7 +263,7 @@ jobs:
 
           # Binarios principales (contenido de bin/ en la raíz del bundle)
           cp -r "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin/." "$BUNDLE_DIR/"
-          
+
           # Recursos asociados
           cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
           cp -r "$GITHUB_WORKSPACE/src/tools" "$BUNDLE_DIR/tools" 2>/dev/null || true
@@ -144,6 +272,7 @@ jobs:
           tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
           echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
           echo "datetime=$DATETIME" >> "$GITHUB_OUTPUT"
+          echo "day=$DAY" >> "$GITHUB_OUTPUT"
 
       # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
       # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
@@ -160,12 +289,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: audiocpp-${{ steps.ver.outputs.name }}-cuda${{ env.CUDA_LABEL }}-${{ steps.pack.outputs.datetime }}
-          name: audio.cpp ${{ steps.ver.outputs.name }} (Ubuntu x64, CUDA ${{ env.CUDA_LABEL }})
-          body: |
-            Build de https://github.com/${{ env.UPSTREAM_REPO }} en el commit `${{ steps.ver.outputs.sha }}`.
-            CUDA archs: `${{ env.CUDA_ARCH }}`.
-            Descripción de la release:
-              ${{ steps.ver.outputs.changelog }}
-            El paquete es un tar.gz con la estructura esperada en la raíz: binarios, tools/, model_specs/ y LICENSE.
+          name: audio.cpp ${{ steps.pack.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64, CUDA ${{ env.CUDA_LABEL }})
+          body_path: release_notes.md
           files: |
             ${{ github.workspace }}/${{ steps.pack.outputs.bin }}
