@@ -67,9 +67,9 @@ jobs:
           echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
           {
             echo "### Check upstream"
-            echo "- Commit actual: \`$SHA\`"
-            echo "- Commit del último release: \`${PREV:-ninguno}\`"
-            echo "- Compilar: **$SHOULD**"
+            echo "- Current commit: \`$SHA\`"
+            echo "- Last release commit: \`${PREV:-ninguno}\`"
+            echo "- Build: **$SHOULD**"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -116,8 +116,8 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build patchelf python3 curl perl
 
-      # Release notes en Markdown (estilo OptiScaler): lista de commits con enlace,
-      # autor y cuerpo en cita. Se guarda en un fichero para usarlo con body_path.
+      # Release notes in Markdown (OptiScaler style): commit list with links,
+      # author and body as a quote. Saved to a file to be used with body_path.
       - name: Generate release notes
         env:
           SHA: ${{ steps.ver.outputs.sha }}
@@ -145,20 +145,20 @@ jobs:
           )
 
           if same:
-              rev, scope = None, "Sin cambios de código desde el build anterior (recompilación)."
+              rev, scope = None, "No code changes since the previous build (rebuild)."
           elif in_range:
               rev = [f"{prev}..{sha}"]
-              scope = (f"### Cambios desde el build anterior "
+              scope = (f"### Changes since the previous build "
                        f"([`{prev[:7]}`...`{sha[:7]}`]({url}/compare/{prev[:7]}...{sha[:7]}))")
           else:
               rev = ["--since=1 day ago", sha]
-              scope = "### Cambios en las últimas 24 horas"
+              scope = "### Changes in the last 24 hours"
 
           lines = [
               f"**Upstream:** [{repo}]({url}) @ [`{sha[:7]}`]({url}/commit/{sha}) (`{version}`)  ",
-              f"**Commit completo:** `{sha}`  ",
+              f"**Full commit:** `{sha}`  ",
               f"**CUDA:** {label} · archs `{arch}`  ",
-              f"**Plataforma:** Ubuntu 24.04 x64",
+              f"**Platform:** Ubuntu 24.04 x64",
               "",
               scope,
               "",
@@ -188,14 +188,14 @@ jobs:
               if entries:
                   lines.append("\n\n".join(entries))
                   if total > len(entries):
-                      lines += ["", f"_…y {total - len(entries)} commits más._"]
+                      lines += ["", f"_…and {total - len(entries)} more commits._"]
               else:
-                  lines.append("Sin commits nuevos en el rango.")
+                  lines.append("No new commits in this range.")
 
           lines += [
               "",
               "---",
-              "El paquete es un `tar.gz` con binarios en la raíz, `tools/`, `model_specs/` y `LICENSE`.",
+              "The package is a `tar.gz` with binaries at the root, `tools/`, `model_specs/` and `LICENSE`.",
           ]
 
           with open("release_notes.md", "w", encoding="utf-8") as f:
