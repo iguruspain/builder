@@ -19,7 +19,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '17 7 * * *' # Hora UTC: 7:00
+    - cron: '17 7 * * *'
 
 permissions:
   contents: write   # crear Release en ESTE repo
