@@ -1,7 +1,9 @@
 # builder
 
-Repositorio de builds de **audio.cpp**. Publica las releases con los binarios
-empaquetados en `audio-*.tar.gz` y un script de instalación para Linux.
+Repositorio de builds para:
+- `audio.cpp`
+
+Publica las releases con los binarios empaquetados y un script de instalación para Linux.
 
 ## Instalación
 
