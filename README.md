@@ -28,17 +28,26 @@ O descárgalo y ejecútalo localmente:
 
 ### Qué hace `install.sh`
 
-1. Consulta la **última release** de [`iguruspain/builder`](https://github.com/iguruspain/builder) vía la API de GitHub.
-2. Localiza el asset `audio-*.tar.gz`.
-3. Lo descarga a `/tmp/audiocpp`.
-4. **Verifica el SHA256** contra el digest publicado en la release (si existe).
-5. Extrae el contenido en `~/.local/share/audiocpp`.
-6. Crea symlinks de los binarios en `~/.local/bin`:
-   - `audiocpp_cli`
-   - `audiocpp_gguf`
-   - `audiocpp_server`
+El script instala todos los repos configurados de forma automática:
+
+1. Consulta la **última release** de cada repositorio vía la API de GitHub.
+2. Localiza el asset que coincide con el patrón configurado.
+3. **Cachea** el archivo en `/tmp/` — si el SHA256 ya coincide, omite descarga y extracción.
+4. **Verifica el SHA256** contra el digest publicado (si existe).
+5. Extrae el contenido en el directorio de instalación.
+6. Crea symlinks de los binarios en `~/.local/bin`.
 
 > Asegúrate de que `~/.local/bin` esté en tu `PATH`.
+
+### Uso
+
+```bash
+./install.sh              # Instala todos los repos configurados
+./install.sh audiocpp     # Instala solo audiocpp
+./install.sh llamacpp     # Instala solo llamacpp
+./install.sh --list       # Lista repos configurados
+./install.sh --help       # Muestra esta ayuda
+```
 
 ### Token de GitHub (opcional)
 
@@ -53,6 +62,6 @@ export GITHUB_TOKEN="ghp_..."
 
 ```
 builder/
-├── install.sh   # Script de descarga, verificación e instalación
+├── install.sh   # Script unificado de descarga, verificación e instalación
 └── README.md
 ```
