@@ -6,7 +6,7 @@
 # Los dos builds corren en paralelo; el job "release" espera a ambos y publica
 # un Release único con los dos tar.gz. Sustituye a build-audiocpp-cuda.yml y
 # build-audiocpp-rpi5.yml (bórralos).
-name: audio.cpp - builds (CUDA 13 + Raspberry Pi 5)
+name: audio.cpp - builds
 
 on:
   workflow_dispatch:
