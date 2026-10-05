@@ -230,16 +230,19 @@ jobs:
           echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       # Igual que el job "Ubuntu x64 (CPU)" de upstream: BoringSSL integrado,
-      # solo hace falta la toolchain.
+      # solo hace falta la toolchain. GCC 14 (no el 13 por defecto): con
+      # CPU_ALL_VARIANTS ggml compila variantes ARM con -march=armv9.2-a+...+sme,
+      # y GCC 13 no conoce "+sme" ("invalid feature modifier 'sme'").
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build gcc-14 g++-14
+          gcc-14 --version | head -n 1
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: audiocpp-ubuntu-24.04-arm-arm64
+          key: audiocpp-ubuntu-24.04-arm-arm64-gcc14
           evict-old-files: 1d
           max-size: "1G"
 
@@ -252,6 +255,8 @@ jobs:
         run: |
           cmake -S . -B build/linux-arm64-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DENGINE_ENABLE_CUDA=OFF \
             -DENGINE_ENABLE_HIP=OFF \
             -DENGINE_ENABLE_VULKAN=OFF \
