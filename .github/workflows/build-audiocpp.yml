@@ -1,0 +1,462 @@
+# Repo de builds: .github/workflows/build-audiocpp.yml
+#
+# UN solo workflow y UN solo Release con los dos paquetes:
+#   - Ubuntu x64 + CUDA 13       (job build-cuda)
+#   - Linux arm64, CPU (Raspberry Pi 5)  (job build-arm64; runner arm64 nativo)
+# Los dos builds corren en paralelo; el job "release" espera a ambos y publica
+# un Release único con los dos tar.gz. Sustituye a build-audiocpp-cuda.yml y
+# build-audiocpp-rpi5.yml (bórralos).
+name: audio.cpp - builds (CUDA 13 + Raspberry Pi 5)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag, branch or commit from 0xShug0/audio.cpp to build (default: main)'
+        default: 'main'
+      cuda_arch:
+        description: 'CUDA archs (ej. "75;80;86;89;90;120")'
+        default: '86' #RTX 30xx
+      publish_release:
+        description: 'Publish a GitHub Release with the builds (default: false)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 7 * * *'
+
+permissions:
+  contents: write   # crear Release en ESTE repo
+  actions: read     # gh run download (artefactos de esta ejecución)
+
+# Evita que dos ejecuciones (p. ej. manual + programada) se pisen
+concurrency:
+  group: audiocpp-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 0xShug0/audio.cpp
+  UPSTREAM_REF: ${{ inputs.ref || 'main' }}
+  CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
+  CUDA_LABEL: '13.4'
+
+jobs:
+  # Job ligero (sin contenedor): resuelve el commit de upstream y decide si hay algo nuevo.
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.c.outputs.sha }}
+      prev_sha: ${{ steps.c.outputs.prev_sha }}
+      should_build: ${{ steps.c.outputs.should_build }}
+      datetime: ${{ steps.c.outputs.datetime }}
+      day: ${{ steps.c.outputs.day }}
+    steps:
+      - name: Check upstream
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_REF}" --jq .sha)"
+
+          # El Release anterior (único, con los dos tar) guarda su commit en el cuerpo: primer SHA de 40 hex
+          BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].body // ""' 2>/dev/null || true)"
+          PREV="$(grep -oE '[0-9a-f]{40}' <<<"$BODY" | head -1 || true)"
+
+          SHOULD=true
+          # Solo en ejecuciones programadas: si upstream no cambió, no se recompila
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$SHA" = "$PREV" ]; then
+            SHOULD=false
+          fi
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "prev_sha=$PREV" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+          # Mismo sello para los dos paquetes y para el tag del Release
+          echo "datetime=$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Check upstream"
+            echo "- Current commit: \`$SHA\`"
+            echo "- Last release commit: \`${PREV:-None}\`"
+            echo "- Build: **$SHOULD**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-cuda:
+    name: Ubuntu x64 (CUDA 13)
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.4.1-devel-ubuntu24.04   # misma imagen que usa llama.cpp
+
+    defaults:
+      run:
+        shell: bash   # los jobs en contenedor usan dash por defecto
+
+    steps:
+      # el contenedor no trae git: instalarlo antes del checkout
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      # Se compila exactamente el commit resuelto en el job "check"
+      - name: Clone audio.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
+          cd src
+          SHA="$(git rev-parse HEAD)"
+          echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
+
+      # Sin libssl-dev: el PKGBUILD usa el BoringSSL integrado (no USE_SYSTEM_OPENSSL)
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build patchelf python3 curl perl
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_LABEL }}
+          evict-old-files: 1d
+          max-size: "1G"
+
+      # Flags del PKGBUILD (rama CI):
+      #  ENGINE_ENABLE_CPU_ALL_VARIANTS=ON  variantes de CPU elegidas en runtime
+      #       => libs ggml/backends compartidas junto a los binarios ($ORIGIN)
+      #  ENGINE_ENABLE_NATIVE_CPU=OFF       sin -march=native del runner
+      #  GGML_CUDA_FA_ALL_QUANTS=ON         FlashAttention para todas las cuantizaciones
+      #       (compila bastante más lento y pesa más)
+      #  CMAKE_CUDA_ARCHITECTURES           explícito: el runner no tiene GPU
+      # Diferencia respecto al PKGBUILD:
+      #  GGML_CUDA_NCCL=OFF  en Arch no hay NCCL instalado, así que no se enlaza;
+      #       este contenedor sí lo trae y acabaría como dependencia (solo sirve multi-GPU)
+      - name: Configure
+        working-directory: src
+        run: |
+          cmake -S . -B build/linux-cuda-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENGINE_ENABLE_CUDA=ON \
+            -DENGINE_ENABLE_HIP=OFF \
+            -DENGINE_ENABLE_VULKAN=OFF \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
+            -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON \
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build/linux-cuda-release --parallel "$(nproc)" \
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+
+      # Empaquetado limpio: solo binarios + recursos que se usan en la misma carpeta.
+      # No se incluye el árbol completo de bin/ porque ahí aparecen .so y symlinks de runtime.
+      - name: Stage bundle
+        id: pack
+        run: |
+          set -euo pipefail
+          DATETIME="${{ needs.check.outputs.datetime }}"
+          SM="${{ steps.ver.outputs.arch }}"
+          BASE="audiocpp-${DATETIME}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${SM}"
+
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR"
+
+          # Binarios principales (contenido de bin/ en la raíz del bundle)
+          cp -r "$GITHUB_WORKSPACE/src/build/linux-cuda-release/bin/." "$BUNDLE_DIR/"
+
+          # Recursos asociados
+          cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/tools" "$BUNDLE_DIR/tools" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/model_specs" "$BUNDLE_DIR/model_specs" 2>/dev/null || true
+
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
+          echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
+      # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
+      - name: Upload artifacts
+        if: ${{ always() && steps.pack.outputs.bin != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.bin }}
+          path: ${{ steps.pack.outputs.bin }}
+          if-no-files-found: error
+
+
+  build-arm64:
+    name: Raspberry Pi 5 (arm64 CPU)
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm   # arm64 nativo (Neoverse); sin contenedor
+
+    steps:
+      # Se compila exactamente el commit resuelto en el job "check"
+      - name: Clone audio.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          cd src
+          SHA="$(git rev-parse HEAD)"
+          echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # Igual que el job "Ubuntu x64 (CPU)" de upstream: BoringSSL integrado,
+      # solo hace falta la toolchain.
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: audiocpp-ubuntu-24.04-arm-arm64
+          evict-old-files: 1d
+          max-size: "1G"
+
+      # Flags en la línea de los de tu build CUDA y del job CPU "portable" de upstream:
+      #  CUDA/Vulkan/HIP OFF                 la Pi 5 se queda en CPU
+      #  ENGINE_ENABLE_CPU_ALL_VARIANTS=ON   variantes de CPU (.so) elegidas en runtime
+      #  ENGINE_ENABLE_NATIVE_CPU=OFF        sin -march=native del runner (Neoverse != Cortex-A76)
+      - name: Configure
+        working-directory: src
+        run: |
+          cmake -S . -B build/linux-arm64-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENGINE_ENABLE_CUDA=OFF \
+            -DENGINE_ENABLE_HIP=OFF \
+            -DENGINE_ENABLE_VULKAN=OFF \
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
+            -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON \
+            -DENGINE_ENABLE_LLAMAFILE=ON \
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build/linux-arm64-release --parallel "$(nproc)" \
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+
+      # El runner es arm64, así que se puede comprobar de verdad: que no falte
+      # ninguna librería y que el binario arranque.
+      - name: Verify
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cd build/linux-arm64-release/bin
+          file audiocpp_cli | grep -q 'ARM aarch64' || { echo "::error::no es un binario aarch64"; exit 1; }
+          for f in audiocpp_* *.so*; do
+            [ -f "$f" ] || continue
+            ldd "$f" 2>&1 | sed "s|^|$f: |"
+          done | tee /tmp/all.ldd
+          if grep -q 'not found' /tmp/all.ldd; then
+            echo "::error::hay dependencias sin resolver"; exit 1
+          fi
+          ./audiocpp_cli --help 2>&1 | head -n 5 || true
+
+      # Mismo empaquetado que el build CUDA: contenido de bin/ en la raíz del tar
+      # (binarios + variantes de CPU .so con sus enlaces) + tools/, model_specs/, LICENSE.
+      - name: Stage bundle
+        id: pack
+        run: |
+          set -euo pipefail
+          DATETIME="${{ needs.check.outputs.datetime }}"
+          BASE="audiocpp-${DATETIME}-bin-linux-arm64"
+
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR"
+
+          cp -a "$GITHUB_WORKSPACE/src/build/linux-arm64-release/bin/." "$BUNDLE_DIR/"
+
+          cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/tools" "$BUNDLE_DIR/tools" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/model_specs" "$BUNDLE_DIR/model_specs" 2>/dev/null || true
+
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
+          echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        if: ${{ always() && steps.pack.outputs.bin != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.bin }}
+          path: ${{ steps.pack.outputs.bin }}
+          if-no-files-found: error
+
+
+  release:
+    name: Publish Release
+    needs: [check, build-cuda, build-arm64]
+    # Solo si los DOS builds terminaron bien (si uno falla, no se publica nada
+    # y el siguiente cron lo reintenta). Los builds se saltan si no hay commit nuevo.
+    if: ${{ inputs.publish_release || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          cd src
+          SHA="$(git rev-parse HEAD)"
+          echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
+
+      # Descarga los tar de ESTA ejecución (cada artefacto queda en su subcarpeta)
+      - name: Download packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts
+          ls -lR artifacts
+
+      # Release notes in Markdown (OptiScaler style): commit list with links,
+      # author and body as a quote. Saved to a file to be used with body_path.
+      - name: Generate release notes
+        env:
+          SHA: ${{ steps.ver.outputs.sha }}
+          VERSION: ${{ steps.ver.outputs.name }}
+          PREV_SHA: ${{ needs.check.outputs.prev_sha }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+
+          def git(*args):
+              return subprocess.run(["git", *args], cwd="src", capture_output=True, text=True)
+
+          repo = os.environ["UPSTREAM_REPO"]
+          sha = os.environ["SHA"]
+          prev = os.environ.get("PREV_SHA", "")
+          version = os.environ["VERSION"]
+          arch = os.environ["CUDA_ARCH"]
+          label = os.environ["CUDA_LABEL"]
+          url = f"https://github.com/{repo}"
+
+          import glob
+          pkgs = sorted(os.path.basename(p) for p in glob.glob("artifacts/*/*.tar.gz"))
+
+          def describe(n):
+              if "cuda" in n:
+                  return f"Ubuntu x64 · CUDA {label} · archs `{arch}`"
+              if "arm64" in n:
+                  return "Linux arm64 (Raspberry Pi 5) · CPU"
+              return ""
+
+          same = bool(prev) and prev == sha
+          in_range = (
+              bool(prev) and not same
+              and git("merge-base", "--is-ancestor", prev, sha).returncode == 0
+          )
+
+          if same:
+              rev, scope = None, "No code changes since the previous build (rebuild)."
+          elif in_range:
+              rev = [f"{prev}..{sha}"]
+              scope = (f"### Changes since the previous build "
+                       f"([`{prev[:7]}`...`{sha[:7]}`]({url}/compare/{prev[:7]}...{sha[:7]}))")
+          else:
+              rev = ["--since=1 day ago", sha]
+              scope = "### Changes in the last 24 hours"
+
+          lines = [
+              f"**Upstream:** [{repo}]({url}) @ [`{sha[:7]}`]({url}/commit/{sha}) (`{version}`)  ",
+              f"**Full commit:** `{sha}`  ",
+              "",
+              "**Packages**",
+              "",
+              *[f"- `{n}` — {describe(n)}" for n in pkgs],
+              "",
+              scope,
+              "",
+          ]
+
+          if rev:
+              total = int(git("rev-list", "--count", "--no-merges", *rev).stdout.strip() or 0)
+              out = git("log", "--no-merges", "-n", "30",
+                        "--format=%h%x1f%H%x1f%s%x1f%b%x1f%an%x1e", *rev).stdout
+              entries = []
+              for rec in out.split("\x1e"):
+                  rec = rec.strip()
+                  if not rec:
+                      continue
+                  p = rec.split("\x1f")
+                  if len(p) < 5:
+                      continue
+                  short, full, subject, body, author = (x.strip() for x in p[:5])
+                  e = f"- [{short}]({url}/commit/{full}) {subject} ({author})"
+                  body_lines = [l.strip() for l in body.splitlines() if l.strip()]
+                  if body_lines:
+                      shown = body_lines[:6]
+                      if len(body_lines) > 6:
+                          shown.append("…")
+                      e += "\n" + "\n".join(f"  > {l}" for l in shown)
+                  entries.append(e)
+              if entries:
+                  lines.append("\n\n".join(entries))
+                  if total > len(entries):
+                      lines += ["", f"_…and {total - len(entries)} more commits._"]
+              else:
+                  lines.append("No new commits in this range.")
+
+          lines += [
+              "",
+              "---",
+              "Each package is a `tar.gz` with binaries at the root, `tools/`, `model_specs/` and `LICENSE`.",
+          ]
+
+          with open("release_notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+          echo "----- release_notes.md -----"
+          cat release_notes.md
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: audiocpp-${{ steps.ver.outputs.name }}-${{ needs.check.outputs.datetime }}
+          name: audio.cpp ${{ needs.check.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64 CUDA ${{ env.CUDA_LABEL }} + Linux arm64)
+          body_path: release_notes.md
+          files: |
+            ${{ github.workspace }}/artifacts/*/*.tar.gz

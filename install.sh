@@ -11,6 +11,12 @@
 ##       Instala todos los repos configurados.
 ##   ./install.sh
 ##       Instala todos los repos configurados (por defecto).
+##   ./install.sh --profile cuda|arm64 [...]
+##       Fuerza el perfil en vez de deducirlo de `uname -m`.
+##
+## Perfil (según `uname -m`):
+##   x86_64          -> cuda   (PC con GPU NVIDIA)
+##   aarch64/arm64   -> arm64  (Raspberry Pi y otros arm64, solo CPU)
 ##
 
 set -euo pipefail
@@ -222,10 +228,12 @@ declare -a CFG_API=(
     "https://api.github.com/repos/iguruspain/builder/releases/latest"
 )
 
-# Patrón regex del asset a buscar (shellopsible para jq test())
-declare -a CFG_PATTERN=(
-    "^llama-b[0-9]+-bin-ubuntu-cuda-13\.4-x64\.tar\.gz$"
-    "audiocpp-.*\.tar\.gz$"
+# Patrón regex del asset a buscar, por "<nombre>:<perfil>" (shellopsible para jq test())
+declare -A CFG_PATTERN=(
+    ['llamacpp:cuda']='^llama-b[0-9]+-bin-ubuntu-cuda-13\.4-x64\.tar\.gz$'
+    ['llamacpp:arm64']='^llama-b[0-9]+-bin-ubuntu-arm64\.tar\.gz$'
+    ['audiocpp:cuda']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda[0-9.]+-sm[^/]*\.tar\.gz$'
+    ['audiocpp:arm64']='^audiocpp-[0-9]+-bin-linux-arm64\.tar\.gz$'
 )
 # Directorio de instalación (~/.local/share/...)
 declare -a CFG_INSTALL_DIR=(
@@ -253,38 +261,67 @@ BIN_DIR="${HOME}/.local/bin"
 
 # --- Parsea argumentos CLI --------------------------------------------------
 
+usage() {
+    echo "Uso: $0 [--profile cuda|arm64] [REPO1 REPO2 ...]"
+    echo "  $0 --all           Instala todos (por defecto)"
+    echo "  $0 --list          Lista repos configurados y el perfil detectado"
+    echo "  $0 --profile P     Fuerza el perfil (cuda | arm64); por defecto se deduce de uname -m"
+    echo "  $0 --help          Muestra esta ayuda"
+}
+
 TARGETS=()
-if [[ $# -eq 0 ]] || [[ "${1:-}" == "--all" ]]; then
-    for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
-        TARGETS+=("${CFG_NAME[$i]}")
-    done
-elif [[ "${1:-}" == "--list" ]]; then
+PROFILE=""
+LIST=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --all)       shift ;;
+        --list)      LIST=true; shift ;;
+        --help|-h)   usage; exit 0 ;;
+        --profile)
+            [[ $# -ge 2 ]] || { err "--profile requiere un valor (cuda|arm64)"; exit 1; }
+            PROFILE="$2"; shift 2 ;;
+        --profile=*) PROFILE="${1#--profile=}"; shift ;;
+        -*)          err "Opción desconocida: $1"; usage; exit 1 ;;
+        *)
+            found=false
+            for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
+                if [[ "$1" == "${CFG_NAME[$i]}" ]]; then found=true; break; fi
+            done
+            if [[ "$found" == "false" ]]; then
+                err "Repositorio '$1' desconocido."
+                echo "  Disponibles: ${CFG_NAME[*]}"
+                exit 1
+            fi
+            TARGETS+=("$1"); shift ;;
+    esac
+done
+
+# --- Perfil: uname -m -------------------------------------------------------
+
+if [[ -z "$PROFILE" ]]; then
+    case "$(uname -m)" in
+        x86_64)         PROFILE="cuda" ;;
+        aarch64|arm64)  PROFILE="arm64" ;;
+        *) err "Arquitectura no soportada: $(uname -m) (usa --profile cuda|arm64)"; exit 1 ;;
+    esac
+fi
+case "$PROFILE" in
+    cuda|arm64) ;;
+    *) err "Perfil inválido: '${PROFILE}' (usa cuda o arm64)"; exit 1 ;;
+esac
+
+if [[ "$LIST" == "true" ]]; then
+    echo "Perfil: ${PROFILE} ($(uname -m))"
     echo "Repositorios configurados:"
     for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
         echo "  ${CFG_NAME[$i]}"
     done
     exit 0
-elif [[ "${1:-}" == "--help" ]]; then
-    echo "Uso: $0 [REPO1 REPO2 ...]"
-    echo "  $0 --all           Instala todos (por defecto)"
-    echo "  $0 --list          Lista repos configurados"
-    echo "  $0 --help          Muestra esta ayuda"
-    exit 0
-else
-    for arg in "$@"; do
-        found=false
-        for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
-            if [[ "$arg" == "${CFG_NAME[$i]}" ]]; then
-                TARGETS+=("$arg")
-                found=true
-                break
-            fi
-        done
-        if [[ "$found" == "false" ]]; then
-            err "Repositorio '${arg}' desconocido."
-            echo "  Disponibles: ${CFG_NAME[*]}"
-            exit 1
-        fi
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
+        TARGETS+=("${CFG_NAME[$i]}")
     done
 fi
 
@@ -304,6 +341,8 @@ resolve_indices() {
 
 check_deps
 build_auth_args
+mkdir -p "$BIN_DIR"
+log "Perfil: ${PROFILE} ($(uname -m))"
 
 for target in "${TARGETS[@]}"; do
     idx="$(resolve_indices "$target")"
@@ -311,7 +350,11 @@ for target in "${TARGETS[@]}"; do
     name="${CFG_NAME[$idx]}"
     repo="${CFG_REPO[$idx]}"
     api_url="${CFG_API[$idx]}"
-    pattern="${CFG_PATTERN[$idx]}"
+    pattern="${CFG_PATTERN[${name}:${PROFILE}]:-}"
+    if [[ -z "$pattern" ]]; then
+        err "No hay build de ${name} para el perfil '${PROFILE}'."
+        exit 1
+    fi
     install_dir="${CFG_INSTALL_DIR[$idx]}"
     mode="${CFG_MODE[$idx]}"
     bins_str="${CFG_BINS[$idx]}"
