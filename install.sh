@@ -46,6 +46,17 @@ build_auth_args() {
     fi
 }
 
+# Muestra la versión del binario actualmente instalado (si existe)
+show_current_version() {
+    local bin="$1"
+    if command -v "$bin" >/dev/null 2>&1; then
+        log "Versión actual de ${bin} ($(command -v "$bin")):"
+        "$bin" --version 2>&1 | head -n 1
+    else
+        log "Versión actual de ${bin}: no instalado"
+    fi
+}
+
 # ============================================================================
 # Verificación SHA256
 # ============================================================================
@@ -253,6 +264,12 @@ declare -a CFG_BINS=(
     "audiocpp_cli audiocpp_gguf audiocpp_server"
 )
 
+# Binarios cuya versión se muestra antes de instalar (vacío = ninguno)
+declare -a CFG_VERSION_BINS=(
+    "llama-server"
+    "audiocpp_server"
+)
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -360,6 +377,10 @@ for target in "${TARGETS[@]}"; do
     bins_str="${CFG_BINS[$idx]}"
 
     log ">>> Instalando: ${name} (${repo}) <<<"
+
+    for vbin in ${CFG_VERSION_BINS[$idx]:-}; do
+        show_current_version "$vbin"
+    done
 
     case "$mode" in
         search)
