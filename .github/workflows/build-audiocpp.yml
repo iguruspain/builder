@@ -40,6 +40,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
+  UPSTREAM_REF: ${{ inputs.ref || 'main' }}
   CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
   CUDA_LABEL: '13.4'
   CUDA_ARCH_PASCAL: ${{ inputs.cuda_arch_pascal || '61' }}
