@@ -1,10 +1,12 @@
 # Repo de builds: .github/workflows/build-audiocpp.yml
 #
-# UN solo workflow y UN solo Release con los dos paquetes:
-#   - Ubuntu x64 + CUDA 13       (job build-cuda)
+# UN solo workflow y UN solo Release con los tres paquetes:
+#   - Ubuntu x64 + CUDA 13.4   (job build-cuda; Turing y superiores)
+#   - Ubuntu x64 + CUDA 12.8   (job build-cuda-pascal; pre-Turing: CUDA 13
+#       eliminó la compilación offline para Maxwell/Pascal/Volta, sm <= 7.5)
 #   - Linux arm64, CPU (Raspberry Pi 5)  (job build-arm64; runner arm64 nativo)
-# Los dos builds corren en paralelo; el job "release" espera a ambos y publica
-# un Release único con los dos tar.gz. Sustituye a build-audiocpp-cuda.yml y
+# Los builds corren en paralelo; el job "release" espera a todos y publica
+# un Release único con los tres tar.gz. Sustituye a build-audiocpp-cuda.yml y
 # build-audiocpp-rpi5.yml (bórralos).
 name: audio.cpp - builds
 
@@ -15,8 +17,11 @@ on:
         description: 'Tag, branch or commit from 0xShug0/audio.cpp to build (default: main)'
         default: 'main'
       cuda_arch:
-        description: 'CUDA archs (ej. "75;80;86;89;90;120")'
+        description: 'CUDA archs del build 13.4 (ej. "75;80;86;89;90;120")'
         default: '86' #RTX 30xx
+      cuda_arch_pascal:
+        description: 'CUDA archs del build 12.8 pre-Turing (ej. "61" = GTX 10xx)'
+        default: '61' #GTX 10xx
       publish_release:
         description: 'Publish a GitHub Release with the builds (default: false)'
         type: boolean
@@ -35,9 +40,10 @@ concurrency:
 
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
-  UPSTREAM_REF: ${{ inputs.ref || 'main' }}
   CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
   CUDA_LABEL: '13.4'
+  CUDA_ARCH_PASCAL: ${{ inputs.cuda_arch_pascal || '61' }}
+  CUDA_PASCAL_LABEL: '12.8'
 
 jobs:
   # Job ligero (sin contenedor): resuelve el commit de upstream y decide si hay algo nuevo.
@@ -129,7 +135,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_LABEL }}
+          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_LABEL }}-${{ steps.ver.outputs.arch }}
           evict-old-files: 1d
           max-size: "1G"
 
@@ -203,6 +209,123 @@ jobs:
           path: ${{ steps.pack.outputs.bin }}
           if-no-files-found: error
 
+
+  build-cuda-pascal:
+    name: Ubuntu x64 (CUDA 12.8, pre-Turing)
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    # CUDA 13.0 eliminó la compilación offline para Maxwell/Pascal/Volta
+    # ("nvcc fatal: Unsupported gpu architecture 'sm_61'"): esas GPUs se
+    # compilan con 12.8, que todavía emite sm_61.
+    container: nvidia/cuda:12.8.2-devel-ubuntu24.04
+
+    defaults:
+      run:
+        shell: bash   # los jobs en contenedor usan dash por defecto
+
+    steps:
+      # el contenedor no trae git: instalarlo antes del checkout
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      # Se compila exactamente el commit resuelto en el job "check"
+      - name: Clone audio.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
+          cd src
+          SHA="$(git rev-parse HEAD)"
+          echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "arch=${CUDA_ARCH_PASCAL//;/-}" >> "$GITHUB_OUTPUT"
+
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build patchelf python3 curl perl
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_PASCAL_LABEL }}-${{ steps.ver.outputs.arch }}
+          evict-old-files: 1d
+          max-size: "1G"
+
+      # Mismos flags que build-cuda; la única diferencia material es el
+      # toolchain 12.8 y las arquitecturas. GGML_CUDA_CCCL_VERSION igual que
+      # el build 12.8 de llama.cpp (el CTK 12.8 trae un CCCL viejo).
+      - name: Configure
+        working-directory: src
+        run: |
+          cmake -S . -B build/linux-cuda-pascal-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENGINE_ENABLE_CUDA=ON \
+            -DENGINE_ENABLE_HIP=OFF \
+            -DENGINE_ENABLE_VULKAN=OFF \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
+            -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON \
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_PASCAL}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        working-directory: src
+        run: |
+          cmake --build build/linux-cuda-pascal-release --parallel "$(nproc)" \
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+
+      # Empaquetado limpio: solo binarios + recursos que se usan en la misma carpeta.
+      - name: Stage bundle
+        id: pack
+        run: |
+          set -euo pipefail
+          DATETIME="${{ needs.check.outputs.datetime }}"
+          SM="${{ steps.ver.outputs.arch }}"
+          BASE="audiocpp-${DATETIME}-bin-ubuntu-x64-cuda${CUDA_PASCAL_LABEL}-sm${SM}"
+
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR"
+
+          # Binarios principales (contenido de bin/ en la raíz del bundle)
+          cp -r "$GITHUB_WORKSPACE/src/build/linux-cuda-pascal-release/bin/." "$BUNDLE_DIR/"
+
+          # Recursos asociados
+          cp "$GITHUB_WORKSPACE/src/LICENSE" "$BUNDLE_DIR/" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/tools" "$BUNDLE_DIR/tools" 2>/dev/null || true
+          cp -r "$GITHUB_WORKSPACE/src/model_specs" "$BUNDLE_DIR/model_specs" 2>/dev/null || true
+
+          tar -czf "$GITHUB_WORKSPACE/$BASE.tar.gz" -C "$BUNDLE_DIR" .
+          echo "bin=$BASE.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # GitHub Actions vuelve a empaquetar los artefactos en ZIP al descargarlos.
+      # Se mantiene como artefacto de inspección, pero el Release usa el tar.gz limpio.
+      - name: Upload artifacts
+        if: ${{ always() && steps.pack.outputs.bin != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pack.outputs.bin }}
+          path: ${{ steps.pack.outputs.bin }}
+          if-no-files-found: error
 
   build-arm64:
     name: Raspberry Pi 5 (arm64 CPU)
@@ -324,8 +447,8 @@ jobs:
 
   release:
     name: Publish Release
-    needs: [check, build-cuda, build-arm64]
-    # Solo si los DOS builds terminaron bien (si uno falla, no se publica nada
+    needs: [check, build-cuda, build-cuda-pascal, build-arm64]
+    # Solo si los TRES builds terminaron bien (si uno falla, no se publica nada
     # y el siguiente cron lo reintenta). Los builds se saltan si no hay commit nuevo.
     if: ${{ inputs.publish_release || github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
@@ -347,7 +470,6 @@ jobs:
           echo "name=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "arch=${CUDA_ARCH//;/-}" >> "$GITHUB_OUTPUT"
 
       # Descarga los tar de ESTA ejecución (cada artefacto queda en su subcarpeta)
       - name: Download packages
@@ -366,7 +488,7 @@ jobs:
           PREV_SHA: ${{ needs.check.outputs.prev_sha }}
         run: |
           python3 - <<'PY'
-          import os, subprocess
+          import os, re, subprocess
 
           def git(*args):
               return subprocess.run(["git", *args], cwd="src", capture_output=True, text=True)
@@ -375,16 +497,17 @@ jobs:
           sha = os.environ["SHA"]
           prev = os.environ.get("PREV_SHA", "")
           version = os.environ["VERSION"]
-          arch = os.environ["CUDA_ARCH"]
-          label = os.environ["CUDA_LABEL"]
+
           url = f"https://github.com/{repo}"
 
           import glob
           pkgs = sorted(os.path.basename(p) for p in glob.glob("artifacts/*/*.tar.gz"))
 
           def describe(n):
-              if "cuda" in n:
-                  return f"Ubuntu x64 · CUDA {label} · archs `{arch}`"
+              # cada paquete lleva su CUDA y sus archs en el nombre
+              m = re.search(r"cuda([0-9.]+)-sm([0-9a-z]+(?:-[0-9a-z]+)*)", n)
+              if m:
+                  return f"Ubuntu x64 · CUDA {m.group(1)} · archs `{m.group(2).replace('-', ';')}`"
               if "arm64" in n:
                   return "Linux arm64 (Raspberry Pi 5) · CPU"
               return ""
@@ -461,7 +584,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: audiocpp-${{ steps.ver.outputs.name }}-${{ needs.check.outputs.datetime }}
-          name: audio.cpp ${{ needs.check.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64 CUDA ${{ env.CUDA_LABEL }} + Linux arm64)
+          name: audio.cpp ${{ needs.check.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64 CUDA ${{ env.CUDA_LABEL }} / ${{ env.CUDA_PASCAL_LABEL }} + Linux arm64)
           body_path: release_notes.md
           files: |
             ${{ github.workspace }}/artifacts/*/*.tar.gz

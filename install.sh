@@ -18,6 +18,9 @@
 ##   x86_64          -> cuda   (PC con GPU NVIDIA)
 ##   aarch64/arm64   -> arm64  (Raspberry Pi y otros arm64, solo CPU)
 ##
+## Assets CUDA: 13.4 para Turing+ (CC >= 8) y 12.8 para Maxwell/Pascal/Volta
+## (CC < 8, ej. GTX 10xx); se detecta con `nvidia-smi --query-gpu=compute_cap`.
+##
 
 set -euo pipefail
 # ============================================================================
@@ -54,6 +57,36 @@ show_current_version() {
         "$bin" --version 2>&1 | head -n 1
     else
         log "Versión actual de ${bin}: no instalado"
+    fi
+}
+
+# --- Assets CUDA: 12.8 o 13.4 según la GPU --------------------------------
+# CUDA 13 (y sus binarios oficiales de llama.cpp) eliminaron Maxwell/Pascal/
+# Volta: las GPUs pre-Turing (CC < 8) usan los assets 12.8.
+CUDA_ASSET=""
+detect_cuda_asset() {
+    local cc=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+    fi
+    if [[ -z "$cc" ]]; then
+        CUDA_ASSET="13.4"
+        log "GPU NVIDIA no detectada: assets CUDA 13.4 por defecto"
+        return
+    fi
+    local major="${cc%%.*}"
+    if (( major < 8 )); then
+        CUDA_ASSET="12.8"
+        log "GPU con compute capability ${cc} (pre-Turing): assets CUDA 12.8"
+        # El asset 12.8 enlaza contra el runtime CUDA 12.x del sistema
+        if ! ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.12'; then
+            log "Aviso: el asset 12.8 necesita el runtime CUDA 12.x (libcudart.so.12, libcublas.so.12)."
+            log "  Instálalo con: sudo apt install cuda-toolkit-12-8"
+            log "  (alternativa: extraer el asset cudart-...-cuda-12.8-x64.tar.gz que llama.cpp publica)"
+        fi
+    else
+        CUDA_ASSET="13.4"
+        log "GPU con compute capability ${cc}: assets CUDA 13.4"
     fi
 }
 
@@ -163,7 +196,7 @@ install_repo_search() {
 
 # ============================================================================
 # Instalación — modo "latest"
-# (releases/latest, binarios explícitos)
+# (releases paginados, retrocede hasta la release más reciente con el asset)
 # ============================================================================
 install_repo_latest() {
     local name="$1" repo="$2" api_url="$3" asset_pattern="$4" install_dir="$5"
@@ -176,18 +209,22 @@ install_repo_latest() {
     release_json="$(curl -fsSL "${CURL_AUTH[@]}" "$api_url")"
 
     asset="$(jq -r --arg p "$asset_pattern" '
-        [.assets[] | select(.name | test($p))] | first | .name // empty
+        [ .[] | .assets[]? | select(.name | test($p)) ] | first | .name // empty
     ' <<<"$release_json")"
 
     if [[ -z "$asset" ]]; then
-        err "No se encontró '${asset_pattern}' en la última release de ${repo}."
+        err "No se encontró '${asset_pattern}' en las últimas releases de ${repo}."
         exit 1
     fi
 
-    asset_url="$(jq -r --arg n "$asset" \
-        '.assets[] | select(.name == $n) | .browser_download_url' <<<"$release_json")"
-    asset_digest="$(jq -r --arg n "$asset" \
-        '.assets[] | select(.name == $n) | .digest // empty' <<<"$release_json")"
+    asset_url="$(jq -r --arg n "$asset" '
+        [ .[] | .assets[]? | select(.name == $n) | .browser_download_url ]
+        | first // empty
+    ' <<<"$release_json")"
+    asset_digest="$(jq -r --arg n "$asset" '
+        [ .[] | .assets[]? | select(.name == $n) | .digest // empty ]
+        | first // empty
+    ' <<<"$release_json")"
 
     log "  Asset: ${asset}"
 
@@ -236,14 +273,16 @@ declare -a CFG_REPO=(
 # URL de la API de GitHub
 declare -a CFG_API=(
     "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30"
-    "https://api.github.com/repos/iguruspain/builder/releases/latest"
+    "https://api.github.com/repos/iguruspain/builder/releases?per_page=30"
 )
 
-# Patrón regex del asset a buscar, por "<nombre>:<perfil>" (shellopsible para jq test())
+# Patrón regex del asset a buscar, por "<nombre>:<perfil>[:<asset cuda>]" (shellopsible para jq test())
 declare -A CFG_PATTERN=(
-    ['llamacpp:cuda']='^llama-b[0-9]+-bin-ubuntu-cuda-13\.4-x64\.tar\.gz$'
+    ['llamacpp:cuda:13.4']='^llama-b[0-9]+-bin-ubuntu-cuda-13\.4-x64\.tar\.gz$'
+    ['llamacpp:cuda:12.8']='^llama-b[0-9]+-bin-ubuntu-cuda-12\.8-x64\.tar\.gz$'
     ['llamacpp:arm64']='^llama-b[0-9]+-bin-ubuntu-arm64\.tar\.gz$'
-    ['audiocpp:cuda']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda[0-9.]+-sm[^/]*\.tar\.gz$'
+    ['audiocpp:cuda:13.4']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda13\.4-sm[^/]*\.tar\.gz$'
+    ['audiocpp:cuda:12.8']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda12\.8-sm[^/]*\.tar\.gz$'
     ['audiocpp:arm64']='^audiocpp-[0-9]+-bin-linux-arm64\.tar\.gz$'
 )
 # Directorio de instalación (~/.local/share/...)
@@ -327,8 +366,16 @@ case "$PROFILE" in
     *) err "Perfil inválido: '${PROFILE}' (usa cuda o arm64)"; exit 1 ;;
 esac
 
+if [[ "$PROFILE" == "cuda" ]]; then
+    detect_cuda_asset
+fi
+
 if [[ "$LIST" == "true" ]]; then
-    echo "Perfil: ${PROFILE} ($(uname -m))"
+    if [[ "$PROFILE" == "cuda" ]]; then
+        echo "Perfil: ${PROFILE} ($(uname -m)) · assets CUDA ${CUDA_ASSET}"
+    else
+        echo "Perfil: ${PROFILE} ($(uname -m))"
+    fi
     echo "Repositorios configurados:"
     for (( i=0; i<${#CFG_NAME[@]}; i++ )); do
         echo "  ${CFG_NAME[$i]}"
@@ -359,7 +406,11 @@ resolve_indices() {
 check_deps
 build_auth_args
 mkdir -p "$BIN_DIR"
-log "Perfil: ${PROFILE} ($(uname -m))"
+if [[ "$PROFILE" == "cuda" ]]; then
+    log "Perfil: ${PROFILE} ($(uname -m)) · assets CUDA ${CUDA_ASSET}"
+else
+    log "Perfil: ${PROFILE} ($(uname -m))"
+fi
 
 for target in "${TARGETS[@]}"; do
     idx="$(resolve_indices "$target")"
@@ -367,7 +418,11 @@ for target in "${TARGETS[@]}"; do
     name="${CFG_NAME[$idx]}"
     repo="${CFG_REPO[$idx]}"
     api_url="${CFG_API[$idx]}"
-    pattern="${CFG_PATTERN[${name}:${PROFILE}]:-}"
+    pkey="${name}:${PROFILE}"
+    if [[ "$PROFILE" == "cuda" ]]; then
+        pkey="${pkey}:${CUDA_ASSET}"
+    fi
+    pattern="${CFG_PATTERN[${pkey}]:-}"
     if [[ -z "$pattern" ]]; then
         err "No hay build de ${name} para el perfil '${PROFILE}'."
         exit 1
