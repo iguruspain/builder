@@ -20,6 +20,9 @@
 ##
 ## Assets CUDA: 13.4 para Turing+ (CC >= 8) y 12.8 para Maxwell/Pascal/Volta
 ## (CC < 8, ej. GTX 10xx); se detecta con `nvidia-smi --query-gpu=compute_cap`.
+## Runtime CUDA: si el sistema no trae el runtime (libcudart.so.NN), se descarga
+## el asset 'cudart-<asset principal>' de la misma release y se extrae junto al
+## binario (RUNPATH $ORIGIN): sin sudo ni variables de entorno.
 ##
 
 set -euo pipefail
@@ -78,11 +81,11 @@ detect_cuda_asset() {
     if (( major < 8 )); then
         CUDA_ASSET="12.8"
         log "GPU con compute capability ${cc} (pre-Turing): assets CUDA 12.8"
-        # El asset 12.8 enlaza contra el runtime CUDA 12.x del sistema
+        # El asset 12.8 enlaza contra el runtime CUDA 12.x; si no está en el
+        # sistema, install_cudart_runtime descarga el asset 'cudart-...' de la
+        # misma release y lo extrae junto al binario (RUNPATH $ORIGIN).
         if ! ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.12'; then
-            log "Aviso: el asset 12.8 necesita el runtime CUDA 12.x (libcudart.so.12, libcublas.so.12)."
-            log "  Instálalo con: sudo apt install cuda-toolkit-12-8"
-            log "  (alternativa: extraer el asset cudart-...-cuda-12.8-x64.tar.gz que llama.cpp publica)"
+            log "Aviso: no hay runtime CUDA 12.x en el sistema; se descargará el asset cudart-...-cuda-12.8-x64."
         fi
     else
         CUDA_ASSET="13.4"
@@ -124,6 +127,66 @@ cached_asset_ok() {
         return 0
     fi
     return 1
+}
+
+# ============================================================================
+# Runtime CUDA — el build cuda de llama.cpp enlaza contra libcudart.so.NN y
+# libcublas.so.NN. Si el sistema no trae ese runtime, se descarga el asset
+# 'cudart-<asset principal>' de la MISMA release (mismo build) y se extrae
+# junto al binario: RUNPATH $ORIGIN lo resuelve sin sudo ni variables.
+# ============================================================================
+install_cudart_runtime() {
+    local main_asset="$1" releases_json="$2" install_dir="$3"
+    local soname_major="${CUDA_ASSET%%.*}"
+    local soname="libcudart.so.${soname_major}"
+
+    if ldconfig -p 2>/dev/null | grep -q "${soname}"; then
+        log "  Runtime CUDA: ${soname} ya presente en el sistema; se omite el asset cudart."
+        return
+    fi
+    if [[ -f "${install_dir}/${soname}" ]]; then
+        log "  Runtime CUDA: ${soname} ya instalado junto al binario; se omite."
+        return
+    fi
+
+    local cudart_asset="cudart-${main_asset}"
+    local tab=$'\t'
+    local lookup cudart_url cudart_digest
+    lookup="$(jq -r --arg main "$main_asset" --arg cud "$cudart_asset" '
+        [ .[]
+          | select(.tag_name | test("^b[0-9]+$"))
+          | select((.assets[]? | select(.name == $main)) | length > 0)
+          | .assets[]?
+          | select(.name == $cud)
+        ] | first | [.browser_download_url // "", .digest // ""] | @tsv
+    ' <<<"$releases_json")"
+    cudart_url="${lookup%%${tab}*}"
+    cudart_digest="${lookup#*${tab}}"
+
+    if [[ -z "$cudart_url" ]]; then
+        err "El sistema no tiene ${soname} y la release no publica '${cudart_asset}'."
+        err "Instala el runtime manualmente (p. ej. 'sudo apt install cuda-toolkit-12-8')."
+        exit 1
+    fi
+
+    log "  Runtime CUDA: asset ${cudart_asset} ..."
+    local dest_file="/tmp/$(basename "$cudart_asset")"
+    local sha_hash
+    if sha_hash="$(cached_asset_ok "$cudart_asset" "$dest_file" "$cudart_digest")"; then
+        log "  Runtime CUDA: caché OK (SHA256 ${sha_hash})"
+    else
+        log "  Runtime CUDA: descargando ..."
+        curl -fL --progress-bar "${CURL_AUTH[@]}" -o "$dest_file" "$cudart_url"
+        verify_sha256 "$cudart_asset" "$dest_file" "$cudart_digest"
+    fi
+    log "  Runtime CUDA: extrayendo en ${install_dir} ..."
+    mkdir -p "$install_dir"
+    tar -xzf "$dest_file" -C "$install_dir" --strip-components=1
+    if [[ ! -f "${install_dir}/${soname}" ]]; then
+        err "El asset cudart no produjo ${install_dir}/${soname}."
+        exit 1
+    fi
+    log "  Runtime CUDA: listo (runtime ${soname_major}.x junto al binario, RUNPATH \$ORIGIN)."
 }
 
 # ============================================================================
@@ -176,6 +239,11 @@ install_repo_search() {
         mkdir -p "$install_dir"
         log "  Extrayendo en ${install_dir} ..."
         tar -xzf "$dest_file" -C "$install_dir" --strip-components=1
+    fi
+
+    # Runtime CUDA (solo builds cuda): las .so del mismo build junto al binario.
+    if [[ "$PROFILE" == "cuda" ]]; then
+        install_cudart_runtime "$asset" "$releases_json" "$install_dir"
     fi
 
 

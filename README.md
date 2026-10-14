@@ -39,7 +39,10 @@ El script instala todos los repos configurados de forma automática:
 4. **Cachea** el archivo en `/tmp/` — si el SHA256 ya coincide, omite descarga y extracción.
 5. **Verifica el SHA256** contra el digest publicado (si existe).
 6. Extrae el contenido en el directorio de instalación.
-7. Crea symlinks de los binarios en `~/.local/bin` (el directorio se crea si no existe).
+7. Perfil `cuda`: si el sistema no tiene el runtime CUDA (`libcudart.so.NN`), descarga el
+   asset `cudart-<asset>` de la misma release y lo extrae junto al binario
+   (`RUNPATH $ORIGIN` lo resuelve: sin sudo ni variables de entorno).
+8. Crea symlinks de los binarios en `~/.local/bin` (el directorio se crea si no existe).
 
 > Asegúrate de que `~/.local/bin` esté en tu `PATH`.
 
@@ -66,11 +69,10 @@ El perfil sale de `uname -m`; con `--profile` se puede forzar.
 
 Notas:
 
-- El perfil `cuda` asume una GPU NVIDIA y el CUDA del sistema (`libcudart`, `libcublas`...).
-  El asset 13.4 enlaza contra CUDA 13.x; el asset 12.8, contra CUDA 12.x (`libcudart.so.12`,
-  `libcublas.so.12`...): si el sistema solo trae CUDA 13, instala además el toolkit 12.8
-  (p. ej. `sudo apt install cuda-toolkit-12-8`) o extrae en un path de librerías el asset
-  `cudart-...-cuda-12.8-x64.tar.gz` que llama.cpp publica al lado de los binarios.
+- El perfil `cuda` asume una GPU NVIDIA. El asset 13.4 enlaza contra CUDA 13.x y el 12.8
+  contra CUDA 12.x (`libcudart.so.NN`, `libcublas.so.NN`...): si el sistema no trae ese
+  runtime, `install.sh` descarga el asset `cudart-...` de la misma release y lo extrae junto
+  al binario — `RUNPATH $ORIGIN` lo resuelve sin sudo ni variables de entorno.
 - CUDA 13 eliminó la compilación offline para Maxwell/Pascal/Volta: las GPUs pre-Turing las cubre
   el asset 12.8, elegido automáticamente vía `nvidia-smi --query-gpu=compute_cap`
   (sin GPU detectada, por defecto 13.4).
