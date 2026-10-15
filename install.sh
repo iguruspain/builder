@@ -57,7 +57,7 @@ show_current_version() {
     local bin="$1"
     if command -v "$bin" >/dev/null 2>&1; then
         log "Versión actual de ${bin} ($(command -v "$bin")):"
-        "$bin" --version 2>&1 | head -n 1
+        "$bin" --version 2>&1 | head -n 1 || true
     else
         log "Versión actual de ${bin}: no instalado"
     fi
@@ -130,10 +130,11 @@ cached_asset_ok() {
 }
 
 # ============================================================================
-# Runtime CUDA — el build cuda de llama.cpp enlaza contra libcudart.so.NN y
-# libcublas.so.NN. Si el sistema no trae ese runtime, se descarga el asset
-# 'cudart-<asset principal>' de la MISMA release (mismo build) y se extrae
-# junto al binario: RUNPATH $ORIGIN lo resuelve sin sudo ni variables.
+# Runtime CUDA — los builds cuda (llama.cpp, audio.cpp) enlazan contra
+# libcudart.so.NN y, según el build, libcublas/libcufft. Si el sistema no
+# trae ese runtime, se descarga el asset 'cudart-<asset principal>' de la
+# MISMA release (mismo build) y se extrae junto al binario: RUNPATH $ORIGIN
+# lo resuelve sin sudo ni variables.
 # ============================================================================
 install_cudart_runtime() {
     local main_asset="$1" releases_json="$2" install_dir="$3"
@@ -154,7 +155,6 @@ install_cudart_runtime() {
     local lookup cudart_url cudart_digest
     lookup="$(jq -r --arg main "$main_asset" --arg cud "$cudart_asset" '
         [ .[]
-          | select(.tag_name | test("^b[0-9]+$"))
           | select((.assets[]? | select(.name == $main)) | length > 0)
           | .assets[]?
           | select(.name == $cud)
@@ -310,6 +310,11 @@ install_repo_latest() {
     fi
 
     mkdir -p "$install_dir"
+
+    # Runtime CUDA (solo builds cuda): las .so del mismo build junto al binario.
+    if [[ "$PROFILE" == "cuda" ]]; then
+        install_cudart_runtime "$asset" "$release_json" "$install_dir"
+    fi
 
 
     for bin in "${bins[@]}"; do

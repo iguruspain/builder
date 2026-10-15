@@ -209,6 +209,37 @@ jobs:
           name: ${{ steps.pack.outputs.bin }}
           path: ${{ steps.pack.outputs.bin }}
           if-no-files-found: error
+      # Runtime CUDA: empaqueta las .so del contenedor que el bundle necesita
+      # (libcudart, libcufft, ...) en un asset propio, como llama.cpp con
+      # 'cudart-<asset principal>'. install.sh lo extrae junto al binario
+      # (RUNPATH $ORIGIN) si el sistema no trae el runtime.
+      - name: Stage CUDA runtime
+        id: cudart
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          RT_DIR="/tmp/audiocpp-cudart"
+          rm -rf "$RT_DIR"
+          mkdir -p "$RT_DIR"
+          # Cierre de librerías de runtime que necesitan los binarios del bundle
+          for f in "$BUNDLE_DIR"/audiocpp_*; do
+            ldd "$f" 2>/dev/null | awk '{print $3}'
+          done | grep -E '^/usr/local/cuda/' | sort -u | while IFS= read -r lib; do
+            cp -L "$lib" "$RT_DIR/$(basename "$lib")"
+          done
+          [ -n "$(ls -A "$RT_DIR")" ] || { echo "::error::no se encontraron librerías CUDA de runtime"; exit 1; }
+          ls -lh "$RT_DIR"
+          BASE="audiocpp-${{ needs.check.outputs.datetime }}-bin-ubuntu-x64-cuda${CUDA_LABEL}-sm${{ steps.ver.outputs.arch }}"
+          tar -czf "$GITHUB_WORKSPACE/cudart-${BASE}.tar.gz" -C "$RT_DIR" .
+          echo "cudart=cudart-${BASE}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CUDA runtime
+        if: ${{ always() && steps.cudart.outputs.cudart != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.cudart.outputs.cudart }}
+          path: ${{ steps.cudart.outputs.cudart }}
+          if-no-files-found: error
 
 
   build-cuda-pascal:
@@ -326,6 +357,34 @@ jobs:
         with:
           name: ${{ steps.pack.outputs.bin }}
           path: ${{ steps.pack.outputs.bin }}
+          if-no-files-found: error
+      # Runtime CUDA (12.8): mismo empaquetado que el job 13.4.
+      - name: Stage CUDA runtime
+        id: cudart
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="/tmp/audiocpp-bundle"
+          RT_DIR="/tmp/audiocpp-cudart"
+          rm -rf "$RT_DIR"
+          mkdir -p "$RT_DIR"
+          # Cierre de librerías de runtime que necesitan los binarios del bundle
+          for f in "$BUNDLE_DIR"/audiocpp_*; do
+            ldd "$f" 2>/dev/null | awk '{print $3}'
+          done | grep -E '^/usr/local/cuda/' | sort -u | while IFS= read -r lib; do
+            cp -L "$lib" "$RT_DIR/$(basename "$lib")"
+          done
+          [ -n "$(ls -A "$RT_DIR")" ] || { echo "::error::no se encontraron librerías CUDA de runtime"; exit 1; }
+          ls -lh "$RT_DIR"
+          BASE="audiocpp-${{ needs.check.outputs.datetime }}-bin-ubuntu-x64-cuda${CUDA_PASCAL_LABEL}-sm${{ steps.ver.outputs.arch }}"
+          tar -czf "$GITHUB_WORKSPACE/cudart-${BASE}.tar.gz" -C "$RT_DIR" .
+          echo "cudart=cudart-${BASE}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CUDA runtime
+        if: ${{ always() && steps.cudart.outputs.cudart != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.cudart.outputs.cudart }}
+          path: ${{ steps.cudart.outputs.cudart }}
           if-no-files-found: error
 
   build-arm64:
@@ -507,6 +566,10 @@ jobs:
           def describe(n):
               # cada paquete lleva su CUDA y sus archs en el nombre
               m = re.search(r"cuda([0-9.]+)-sm([0-9a-z]+(?:-[0-9a-z]+)*)", n)
+              if n.startswith("cudart-"):
+                  if m:
+                      return f"Runtime CUDA {m.group(1)} (libs del build sm{m.group(2).replace('-', ';')})"
+                  return "Runtime CUDA"
               if m:
                   return f"Ubuntu x64 · CUDA {m.group(1)} · archs `{m.group(2).replace('-', ';')}`"
               if "arm64" in n:

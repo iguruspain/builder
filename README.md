@@ -2,7 +2,9 @@
 
 Repositorio de builds para:
 - `audio.cpp` (Ubuntu x64 + CUDA 13.4 para Turing+, Ubuntu x64 + CUDA 12.8 para
-  Maxwell/Pascal/Volta y Linux arm64 CPU, en una única release con los `tar.gz` correspondientes)
+  Maxwell/Pascal/Volta y Linux arm64 CPU, en una única release con los `tar.gz`
+  correspondientes y un asset `cudart-<paquete>` por build CUDA con las librerías del
+  runtime, el equivalente al de llama.cpp)
 
 Publica las releases con los binarios empaquetados y un script de instalación para Linux
 que elige automáticamente el build adecuado para la máquina (ver [Perfiles](#perfiles)).
@@ -70,9 +72,10 @@ El perfil sale de `uname -m`; con `--profile` se puede forzar.
 Notas:
 
 - El perfil `cuda` asume una GPU NVIDIA. El asset 13.4 enlaza contra CUDA 13.x y el 12.8
-  contra CUDA 12.x (`libcudart.so.NN`, `libcublas.so.NN`...): si el sistema no trae ese
-  runtime, `install.sh` descarga el asset `cudart-...` de la misma release y lo extrae junto
-  al binario — `RUNPATH $ORIGIN` lo resuelve sin sudo ni variables de entorno.
+  contra CUDA 12.x (`libcudart.so.NN`, `libcublas.so.NN`, `libcufft.so.NN`...): si el
+  sistema no trae ese runtime, `install.sh` descarga el asset `cudart-...` de la misma
+  release (llama.cpp y audio.cpp publican uno por build) y lo extrae junto al binario —
+  `RUNPATH $ORIGIN` lo resuelve sin sudo ni variables de entorno.
 - CUDA 13 eliminó la compilación offline para Maxwell/Pascal/Volta: las GPUs pre-Turing las cubre
   el asset 12.8, elegido automáticamente vía `nvidia-smi --query-gpu=compute_cap`
   (sin GPU detectada, por defecto 13.4).
@@ -96,6 +99,7 @@ export GITHUB_TOKEN="ghp_..."
 
 ```
 builder/
-├── install.sh   # Script unificado de descarga, verificación e instalación
-└── README.md
+├── install.sh                              # Script unificado de descarga, verificación e instalación
+├── README.md
+└── .github/workflows/build-audiocpp.yml    # Builds de audio.cpp: paquetes + assets cudart-...
 ```
