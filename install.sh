@@ -198,34 +198,32 @@ install_repo_search() {
 
     log "Consultando las últimas releases de ${repo}..."
 
-    local releases_json
+    local releases_json lookup asset asset_url asset_digest
+    local tab=$'\t'
     releases_json="$(curl -fsSL "${CURL_AUTH[@]}" "$api_url")"
 
-    local asset asset_url asset_digest
-
-    asset="$(jq -r --arg p "$asset_pattern" '
-        [ .[]
-          | select(.tag_name | test("^b[0-9]+$"))
-          | .assets[]?
-          | select(.name | test($p))
-        ] | first | .name // empty
+    # El orden del array de la API no es fiable (ordena por created_at, no
+    # por publicación; con empates es arbitrario): se ordena explícitamente
+    # por número de build (tag b<N>) y se toma el asset de la release con
+    # el build mayor que lo publique.
+    lookup="$(jq -r --arg p "$asset_pattern" '
+        [ .[] | select(.tag_name | test("^b[0-9]+$"))
+          | { b: (.tag_name[1:] | tonumber), assets: (.assets // []) } ]
+        | sort_by(.b) | reverse
+        | [ .[].assets[] | select(.name | test($p)) ]
+        | first
+        | [ .name // "", .browser_download_url // "", .digest // "" ]
+        | @tsv
     ' <<<"$releases_json")"
+    asset="${lookup%%${tab}*}"
+    local rest="${lookup#*${tab}}"
+    asset_url="${rest%%${tab}*}"
+    asset_digest="${rest#*${tab}}"
 
     if [[ -z "$asset" ]]; then
         err "No se encontró '${asset_pattern}' en las últimas releases de ${repo}."
         exit 1
     fi
-
-    asset_url="$(jq -r --arg n "$asset" '
-        [ .[] | select(.tag_name | test("^b[0-9]+$")) | .assets[]?
-          | select(.name == $n)
-        ] | first | .browser_download_url
-    ' <<<"$releases_json")"
-    asset_digest="$(jq -r --arg n "$asset" '
-        [ .[] | select(.tag_name | test("^b[0-9]+$")) | .assets[]?
-          | select(.name == $n)
-        ] | first | .digest // empty
-    ' <<<"$releases_json")"
 
     log "  Asset: ${asset}"
     local dest_file="/tmp/$(basename "$asset")"
@@ -273,26 +271,31 @@ install_repo_latest() {
 
     log "Consultando la última release de ${repo}..."
 
-    local release_json asset asset_url asset_digest
+    local release_json lookup asset asset_url asset_digest
+    local tab=$'\t'
     release_json="$(curl -fsSL "${CURL_AUTH[@]}" "$api_url")"
 
-    asset="$(jq -r --arg p "$asset_pattern" '
-        [ .[] | .assets[]? | select(.name | test($p)) ] | first | .name // empty
+    # El orden del array de la API no es fiable (ordena por created_at, no
+    # por publicación; con empates es arbitrario): se ordena explícitamente
+    # por published_at y se toma el asset de la release más reciente que lo
+    # publique.
+    lookup="$(jq -r --arg p "$asset_pattern" '
+        [ .[] | { pub: (.published_at // .created_at), assets: (.assets // []) } ]
+        | sort_by(.pub) | reverse
+        | [ .[].assets[] | select(.name | test($p)) ]
+        | first
+        | [ .name // "", .browser_download_url // "", .digest // "" ]
+        | @tsv
     ' <<<"$release_json")"
+    asset="${lookup%%${tab}*}"
+    local rest="${lookup#*${tab}}"
+    asset_url="${rest%%${tab}*}"
+    asset_digest="${rest#*${tab}}"
 
     if [[ -z "$asset" ]]; then
         err "No se encontró '${asset_pattern}' en las últimas releases de ${repo}."
         exit 1
     fi
-
-    asset_url="$(jq -r --arg n "$asset" '
-        [ .[] | .assets[]? | select(.name == $n) | .browser_download_url ]
-        | first // empty
-    ' <<<"$release_json")"
-    asset_digest="$(jq -r --arg n "$asset" '
-        [ .[] | .assets[]? | select(.name == $n) | .digest // empty ]
-        | first // empty
-    ' <<<"$release_json")"
 
     log "  Asset: ${asset}"
 
