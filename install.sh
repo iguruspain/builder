@@ -18,8 +18,11 @@
 ##   x86_64          -> cuda   (PC con GPU NVIDIA)
 ##   aarch64/arm64   -> arm64  (Raspberry Pi y otros arm64, solo CPU)
 ##
-## Assets CUDA: 13.4 para Turing+ (CC >= 8) y 12.8 para Maxwell/Pascal/Volta
-## (CC < 8, ej. GTX 10xx); se detecta con `nvidia-smi --query-gpu=compute_cap`.
+## Assets CUDA: rama 13.x para Turing+ (CC >= 8) y rama 12.x para
+## Maxwell/Pascal/Volta (CC < 8, ej. GTX 10xx); se detecta la rama con
+## `nvidia-smi --query-gpu=compute_cap` y la minor (13.4, 13.5, ...) NO se
+## fija: se acepta cualquier cuda-13\.[0-9]+ / cuda-12\.[0-9]+ que publique la
+## release, porque upstream sube la minor con el tiempo (13.4 -> 13.5 -> ...).
 ## Runtime CUDA: si el sistema no trae el runtime (libcudart.so.NN), se descarga
 ## el asset 'cudart-<asset principal>' de la misma release y se extrae junto al
 ## binario (RUNPATH $ORIGIN): sin sudo ni variables de entorno.
@@ -52,6 +55,21 @@ build_auth_args() {
     fi
 }
 
+# Caché de assets descargados (sobrevive reinicios, a diferencia de /tmp).
+# cached_asset_ok verifica el SHA256 antes de reutilizar; una descarga cortada
+# queda invalidada y se vuelve a bajar.
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/install-sh"
+
+download_asset() {
+    local url="$1" dest="$2"
+    mkdir -p "$CACHE_DIR" "$(dirname "$dest")"
+    if ! curl -fL --retry 3 --retry-connrefused --progress-bar "${CURL_AUTH[@]}" -o "$dest" "$url"; then
+        rm -f "$dest"
+        err "Falló la descarga: ${url}"
+        exit 1
+    fi
+}
+
 # Muestra la versión del binario actualmente instalado (si existe)
 show_current_version() {
     local bin="$1"
@@ -63,9 +81,12 @@ show_current_version() {
     fi
 }
 
-# --- Assets CUDA: 12.8 o 13.4 según la GPU --------------------------------
+# --- Assets CUDA: rama 12.x o 13.x según la GPU ----------------------------
 # CUDA 13 (y sus binarios oficiales de llama.cpp) eliminaron Maxwell/Pascal/
-# Volta: las GPUs pre-Turing (CC < 8) usan los assets 12.8.
+# Volta: las GPUs pre-Turing (CC < 8) usan la rama 12.x. Solo se fija la RAMA
+# (define el soname libcudart.so.NN); la minor la elige la propia release vía
+# el patrón cuda-1[23]\.[0-9]+ — así el script no se rompe cuando upstream
+# sube la minor (13.4 -> 13.5, etc.).
 CUDA_ASSET=""
 detect_cuda_asset() {
     local cc=""
@@ -73,23 +94,23 @@ detect_cuda_asset() {
         cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 || true)"
     fi
     if [[ -z "$cc" ]]; then
-        CUDA_ASSET="13.4"
-        log "GPU NVIDIA no detectada: assets CUDA 13.4 por defecto"
+        CUDA_ASSET="13"
+        log "GPU NVIDIA no detectada: rama CUDA 13.x por defecto"
         return
     fi
     local major="${cc%%.*}"
     if (( major < 8 )); then
-        CUDA_ASSET="12.8"
-        log "GPU con compute capability ${cc} (pre-Turing): assets CUDA 12.8"
-        # El asset 12.8 enlaza contra el runtime CUDA 12.x; si no está en el
+        CUDA_ASSET="12"
+        log "GPU con compute capability ${cc} (pre-Turing): rama CUDA 12.x"
+        # El build 12.x enlaza contra el runtime CUDA 12.x; si no está en el
         # sistema, install_cudart_runtime descarga el asset 'cudart-...' de la
         # misma release y lo extrae junto al binario (RUNPATH $ORIGIN).
         if ! ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.12'; then
-            log "Aviso: no hay runtime CUDA 12.x en el sistema; se descargará el asset cudart-...-cuda-12.8-x64."
+            log "Aviso: no hay runtime CUDA 12.x en el sistema; se descargará el asset cudart-... del mismo build."
         fi
     else
-        CUDA_ASSET="13.4"
-        log "GPU con compute capability ${cc}: assets CUDA 13.4"
+        CUDA_ASSET="13"
+        log "GPU con compute capability ${cc}: rama CUDA 13.x"
     fi
 }
 
@@ -165,18 +186,18 @@ install_cudart_runtime() {
 
     if [[ -z "$cudart_url" ]]; then
         err "El sistema no tiene ${soname} y la release no publica '${cudart_asset}'."
-        err "Instala el runtime manualmente (p. ej. 'sudo apt install cuda-toolkit-12-8')."
+        err "Instala un runtime que provea ${soname} (p. ej. el meta-paquete cuda-toolkit de la rama ${soname_major}.x)."
         exit 1
     fi
 
     log "  Runtime CUDA: asset ${cudart_asset} ..."
-    local dest_file="/tmp/$(basename "$cudart_asset")"
+    local dest_file="${CACHE_DIR}/$(basename "$cudart_asset")"
     local sha_hash
     if sha_hash="$(cached_asset_ok "$cudart_asset" "$dest_file" "$cudart_digest")"; then
         log "  Runtime CUDA: caché OK (SHA256 ${sha_hash})"
     else
         log "  Runtime CUDA: descargando ..."
-        curl -fL --progress-bar "${CURL_AUTH[@]}" -o "$dest_file" "$cudart_url"
+        download_asset "$cudart_url" "$dest_file"
         verify_sha256 "$cudart_asset" "$dest_file" "$cudart_digest"
     fi
     log "  Runtime CUDA: extrayendo en ${install_dir} ..."
@@ -226,18 +247,21 @@ install_repo_search() {
     fi
 
     log "  Asset: ${asset}"
-    local dest_file="/tmp/$(basename "$asset")"
+    local dest_file="${CACHE_DIR}/$(basename "$asset")"
     local sha_hash
     if sha_hash="$(cached_asset_ok "$asset" "$dest_file" "$asset_digest")"; then
-        log "  Caché: ${asset} (SHA256 ${sha_hash}, se omite descarga y extracción)"
+        log "  Caché: ${asset} (SHA256 ${sha_hash}, se omite la descarga)"
     else
         log "  Descargando ..."
-        curl -fL --progress-bar "${CURL_AUTH[@]}" -o "$dest_file" "$asset_url"
+        download_asset "$asset_url" "$dest_file"
         verify_sha256 "$asset" "$dest_file" "$asset_digest"
-        mkdir -p "$install_dir"
-        log "  Extrayendo en ${install_dir} ..."
-        tar -xzf "$dest_file" -C "$install_dir" --strip-components=1
     fi
+    # Se extrae siempre, incluso con caché OK: si alguien borró install_dir a
+    # mano, la caché por sí sola no garantiza que los binarios estén donde
+    # deben (antes de esto el script fallaba con "no se encontraron binarios").
+    mkdir -p "$install_dir"
+    log "  Extrayendo en ${install_dir} ..."
+    tar -xzf "$dest_file" -C "$install_dir" --strip-components=1
 
     # Runtime CUDA (solo builds cuda): las .so del mismo build junto al binario.
     if [[ "$PROFILE" == "cuda" ]]; then
@@ -299,20 +323,21 @@ install_repo_latest() {
 
     log "  Asset: ${asset}"
 
-    local dest_file="/tmp/$(basename "$asset")"
+    local dest_file="${CACHE_DIR}/$(basename "$asset")"
     local sha_hash
     if sha_hash="$(cached_asset_ok "$asset" "$dest_file" "$asset_digest")"; then
-        log "  Caché: ${asset} (SHA256 ${sha_hash}, se omite descarga y extracción)"
+        log "  Caché: ${asset} (SHA256 ${sha_hash}, se omite la descarga)"
     else
         log "  Descargando ..."
-        curl -fL --progress-bar "${CURL_AUTH[@]}" -o "$dest_file" "$asset_url"
+        download_asset "$asset_url" "$dest_file"
         verify_sha256 "$asset" "$dest_file" "$asset_digest"
-        mkdir -p "$install_dir"
-        log "  Extrayendo en ${install_dir} ..."
-        tar -xzf "$dest_file" -C "$install_dir"
     fi
-
+    # Se extrae siempre, incluso con caché OK: si alguien borró install_dir a
+    # mano, la caché por sí sola no garantiza que los binarios estén donde
+    # deben.
     mkdir -p "$install_dir"
+    log "  Extrayendo en ${install_dir} ..."
+    tar -xzf "$dest_file" -C "$install_dir"
 
     # Runtime CUDA (solo builds cuda): las .so del mismo build junto al binario.
     if [[ "$PROFILE" == "cuda" ]]; then
@@ -352,13 +377,15 @@ declare -a CFG_API=(
     "https://api.github.com/repos/iguruspain/builder/releases?per_page=30"
 )
 
-# Patrón regex del asset a buscar, por "<nombre>:<perfil>[:<asset cuda>]" (shellopsible para jq test())
+# Patrón regex del asset a buscar, por "<nombre>:<perfil>[:<rama cuda 12|13>]"
+# (shell-escape para jq test()). La minor CUDA NO se fija: coincide cualquier
+# 12.x/13.x que publique la release (upstream la sube con el tiempo).
 declare -A CFG_PATTERN=(
-    ['llamacpp:cuda:13.4']='^llama-b[0-9]+-bin-ubuntu-cuda-13\.4-x64\.tar\.gz$'
-    ['llamacpp:cuda:12.8']='^llama-b[0-9]+-bin-ubuntu-cuda-12\.8-x64\.tar\.gz$'
+    ['llamacpp:cuda:13']='^llama-b[0-9]+-bin-ubuntu-cuda-13\.[0-9]+-x64\.tar\.gz$'
+    ['llamacpp:cuda:12']='^llama-b[0-9]+-bin-ubuntu-cuda-12\.[0-9]+-x64\.tar\.gz$'
     ['llamacpp:arm64']='^llama-b[0-9]+-bin-ubuntu-arm64\.tar\.gz$'
-    ['audiocpp:cuda:13.4']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda13\.4-sm[^/]*\.tar\.gz$'
-    ['audiocpp:cuda:12.8']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda12\.8-sm[^/]*\.tar\.gz$'
+    ['audiocpp:cuda:13']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda13\.[0-9]+-sm[^/]*\.tar\.gz$'
+    ['audiocpp:cuda:12']='^audiocpp-[0-9]+-bin-ubuntu-x64-cuda12\.[0-9]+-sm[^/]*\.tar\.gz$'
     ['audiocpp:arm64']='^audiocpp-[0-9]+-bin-linux-arm64\.tar\.gz$'
 )
 # Directorio de instalación (~/.local/share/...)
@@ -448,7 +475,7 @@ fi
 
 if [[ "$LIST" == "true" ]]; then
     if [[ "$PROFILE" == "cuda" ]]; then
-        echo "Perfil: ${PROFILE} ($(uname -m)) · assets CUDA ${CUDA_ASSET}"
+        echo "Perfil: ${PROFILE} ($(uname -m)) · rama CUDA ${CUDA_ASSET}.x"
     else
         echo "Perfil: ${PROFILE} ($(uname -m))"
     fi
@@ -483,7 +510,7 @@ check_deps
 build_auth_args
 mkdir -p "$BIN_DIR"
 if [[ "$PROFILE" == "cuda" ]]; then
-    log "Perfil: ${PROFILE} ($(uname -m)) · assets CUDA ${CUDA_ASSET}"
+    log "Perfil: ${PROFILE} ($(uname -m)) · rama CUDA ${CUDA_ASSET}.x"
 else
     log "Perfil: ${PROFILE} ($(uname -m))"
 fi

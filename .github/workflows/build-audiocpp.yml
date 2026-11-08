@@ -1,8 +1,8 @@
 # Repo de builds: .github/workflows/build-audiocpp.yml
 #
 # UN solo workflow y UN solo Release con los tres paquetes:
-#   - Ubuntu x64 + CUDA 13.4   (job build-cuda; Turing y superiores)
-#   - Ubuntu x64 + CUDA 12.8   (job build-cuda-pascal; pre-Turing: CUDA 13
+#   - Ubuntu x64 + CUDA 13.x   (job build-cuda; Turing y superiores)
+#   - Ubuntu x64 + CUDA 12.x   (job build-cuda-pascal; pre-Turing: CUDA 13
 #       eliminó la compilación offline para Maxwell/Pascal/Volta, sm <= 7.5)
 #   - Linux arm64, CPU (Raspberry Pi 5)  (job build-arm64; runner arm64 nativo)
 # Los builds corren en paralelo; el job "release" espera a todos y publica
@@ -17,10 +17,10 @@ on:
         description: 'Tag, branch or commit from 0xShug0/audio.cpp to build (default: main)'
         default: 'main'
       cuda_arch:
-        description: 'CUDA archs del build 13.4 (ej. "75;80;86;89;90;120")'
+        description: 'CUDA archs del build 13.x (ej. "75;80;86;89;90;120")'
         default: '86' #RTX 30xx
       cuda_arch_pascal:
-        description: 'CUDA archs del build 12.8 pre-Turing (ej. "61" = GTX 10xx)'
+        description: 'CUDA archs del build 12.x pre-Turing (ej. "61" = GTX 10xx)'
         default: '61' #GTX 10xx
       publish_release:
         description: 'Publish a GitHub Release with the builds (default: false)'
@@ -38,13 +38,15 @@ concurrency:
   group: audiocpp-build
   cancel-in-progress: false
 
+# La etiqueta CUDA de los nombres de asset (cuda13.x / cuda12.x) NO se fija
+# aquí: se deriva del nvcc real de cada contenedor en cada job
+# ("Derive CUDA label from nvcc"). La imagen del contenedor es la única
+# fuente de verdad de la versión de CUDA.
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
   UPSTREAM_REF: ${{ inputs.ref || 'main' }}
   CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
-  CUDA_LABEL: '13.4'
   CUDA_ARCH_PASCAL: ${{ inputs.cuda_arch_pascal || '61' }}
-  CUDA_PASCAL_LABEL: '12.8'
 
 jobs:
   # Job ligero (sin contenedor): resuelve el commit de upstream y decide si hay algo nuevo.
@@ -91,8 +93,13 @@ jobs:
   build-cuda:
     name: Ubuntu x64 (CUDA 13)
     needs: check
+    outputs:
+      cuda_label: ${{ steps.cuda.outputs.label }}
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
+    # Subir la minor de CUDA = cambiar SOLO este tag: la etiqueta 'cudaNN.N'
+    # del asset se deriva del nvcc real del contenedor (paso "Derive CUDA
+    # label") y install.sh acepta cualquier 13.x.
     container: nvidia/cuda:13.4.1-devel-ubuntu24.04   # misma imagen que usa llama.cpp
 
     defaults:
@@ -105,6 +112,20 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
+
+      # Única fuente de verdad de la versión CUDA: el nvcc REAL del contenedor.
+      # Alimenta CUDA_LABEL (nombres de asset y clave de ccache) y el output
+      # cuda_label (nombre del Release); así el toolchain y el nombre del
+      # asset jamás se desalinean al subir la imagen.
+      - name: Derive CUDA label from nvcc
+        id: cuda
+        run: |
+          set -euo pipefail
+          LABEL="$(nvcc --version | sed -nE 's/.*release ([0-9]+\.[0-9]+),.*/\1/p')"
+          [ -n "$LABEL" ] || { echo "::error::no se pudo leer la versión de nvcc"; exit 1; }
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "CUDA_LABEL=$LABEL" >> "$GITHUB_ENV"
+          echo "Etiqueta CUDA derivada del toolchain: $LABEL"
 
       # Se compila exactamente el commit resuelto en el job "check"
       - name: Clone audio.cpp
@@ -136,7 +157,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_LABEL }}-${{ steps.ver.outputs.arch }}
+          key: audiocpp-ubuntu-24.04-cuda-${{ steps.cuda.outputs.label }}-${{ steps.ver.outputs.arch }}
           evict-old-files: 1d
           max-size: "1G"
 
@@ -243,13 +264,16 @@ jobs:
 
 
   build-cuda-pascal:
-    name: Ubuntu x64 (CUDA 12.8, pre-Turing)
+    name: Ubuntu x64 (CUDA 12.x, pre-Turing)
     needs: check
+    outputs:
+      cuda_label: ${{ steps.cuda.outputs.label }}
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     # CUDA 13.0 eliminó la compilación offline para Maxwell/Pascal/Volta
     # ("nvcc fatal: Unsupported gpu architecture 'sm_61'"): esas GPUs se
-    # compilan con 12.8, que todavía emite sm_61.
+    # compilan con la rama 12.x, que todavía emite sm_61. Subir la minor 12.x
+    # = cambiar SOLO este tag (la etiqueta del asset se deriva del nvcc).
     container: nvidia/cuda:12.8.2-devel-ubuntu24.04
 
     defaults:
@@ -262,6 +286,17 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
+
+      # Igual que en build-cuda: la etiqueta (cuda12.x) sale del nvcc real.
+      - name: Derive CUDA label from nvcc
+        id: cuda
+        run: |
+          set -euo pipefail
+          LABEL="$(nvcc --version | sed -nE 's/.*release ([0-9]+\.[0-9]+),.*/\1/p')"
+          [ -n "$LABEL" ] || { echo "::error::no se pudo leer la versión de nvcc"; exit 1; }
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "CUDA_PASCAL_LABEL=$LABEL" >> "$GITHUB_ENV"
+          echo "Etiqueta CUDA derivada del toolchain: $LABEL"
 
       # Se compila exactamente el commit resuelto en el job "check"
       - name: Clone audio.cpp
@@ -292,13 +327,15 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: audiocpp-ubuntu-24.04-cuda-${{ env.CUDA_PASCAL_LABEL }}-${{ steps.ver.outputs.arch }}
+          key: audiocpp-ubuntu-24.04-cuda-${{ steps.cuda.outputs.label }}-${{ steps.ver.outputs.arch }}
           evict-old-files: 1d
           max-size: "1G"
 
       # Mismos flags que build-cuda; la única diferencia material es el
       # toolchain 12.8 y las arquitecturas. GGML_CUDA_CCCL_VERSION igual que
-      # el build 12.8 de llama.cpp (el CTK 12.8 trae un CCCL viejo).
+      # el build 12.8 de llama.cpp (el CTK 12.8 trae un CCCL viejo). Si se sube
+      # la imagen 12.x, revisar este pin: los CTK nuevos traen CCCL nuevo (igual
+      # que hace llama.cpp al subir su imagen).
       - name: Configure
         working-directory: src
         run: |
@@ -648,7 +685,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: audiocpp-${{ steps.ver.outputs.name }}-${{ needs.check.outputs.datetime }}
-          name: audio.cpp ${{ needs.check.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64 CUDA ${{ env.CUDA_LABEL }} / ${{ env.CUDA_PASCAL_LABEL }} + Linux arm64)
+          name: audio.cpp ${{ needs.check.outputs.day }} · ${{ steps.ver.outputs.short }} (Ubuntu x64 CUDA ${{ needs.build-cuda.outputs.cuda_label || '13.x' }} / ${{ needs.build-cuda-pascal.outputs.cuda_label || '12.x' }} + Linux arm64)
           body_path: release_notes.md
           files: |
             ${{ github.workspace }}/artifacts/*/*.tar.gz
