@@ -75,7 +75,7 @@ show_current_version() {
     local bin="$1"
     if command -v "$bin" >/dev/null 2>&1; then
         log "Versión actual de ${bin} ($(command -v "$bin")):"
-        "$bin" --version 2>&1 | head -n 1 || true
+        "$bin" --version 2>&1 | sed -n '2p' || true
     else
         log "Versión actual de ${bin}: no instalado"
     fi
