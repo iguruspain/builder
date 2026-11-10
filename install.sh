@@ -73,9 +73,10 @@ download_asset() {
 # Muestra la versión del binario actualmente instalado (si existe)
 show_current_version() {
     local bin="$1"
+    local line="${2:-1}"
     if command -v "$bin" >/dev/null 2>&1; then
         log "Versión actual de ${bin} ($(command -v "$bin")):"
-        "$bin" --version 2>&1 | sed -n '2p' || true
+        "$bin" --version 2>&1 | sed -n "${line}p" || true
     else
         log "Versión actual de ${bin}: no instalado"
     fi
@@ -537,7 +538,11 @@ for target in "${TARGETS[@]}"; do
     log ">>> Instalando: ${name} (${repo}) <<<"
 
     for vbin in ${CFG_VERSION_BINS[$idx]:-}; do
-        show_current_version "$vbin"
+        vline=1
+        case "$vbin" in
+            audiocpp_server) vline=2 ;;  # audio.cpp: la versión (commit/fecha) va en la 2ª línea
+        esac
+        show_current_version "$vbin" "$vline"
     done
 
     case "$mode" in
