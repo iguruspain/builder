@@ -194,7 +194,7 @@ jobs:
         working-directory: src
         run: |
           cmake --build build/linux-cuda-release --parallel "$(nproc)" \
-            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf --target audiocpp_model_manager
 
       # Empaquetado limpio: solo binarios + recursos que se usan en la misma carpeta.
       # No se incluye el árbol completo de bin/ porque ahí aparecen .so y symlinks de runtime.
@@ -360,7 +360,7 @@ jobs:
         working-directory: src
         run: |
           cmake --build build/linux-cuda-pascal-release --parallel "$(nproc)" \
-            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf --target audiocpp_model_manager
 
       # Empaquetado limpio: solo binarios + recursos que se usan en la misma carpeta.
       - name: Stage bundle
@@ -492,7 +492,7 @@ jobs:
         working-directory: src
         run: |
           cmake --build build/linux-arm64-release --parallel "$(nproc)" \
-            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf
+            --target audiocpp_cli --target audiocpp_server --target audiocpp_gguf --target audiocpp_model_manager
 
       # El runner es arm64, así que se puede comprobar de verdad: que no falte
       # ninguna librería y que el binario arranque.

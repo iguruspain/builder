@@ -404,7 +404,7 @@ declare -a CFG_MODE=(
 # Lista de binarios (modo latest; vacío para search)
 declare -a CFG_BINS=(
     ""
-    "audiocpp_cli audiocpp_gguf audiocpp_server"
+    "audiocpp_cli audiocpp_gguf audiocpp_server audiocpp_model_manager"
 )
 
 # Binarios cuya versión se muestra antes de instalar (vacío = ninguno)
