@@ -18,7 +18,7 @@ on:
         default: 'main'
       cuda_arch:
         description: 'CUDA archs del build 13.x (ej. "75;80;86;89;90;120")'
-        default: '86' #RTX 30xx
+        default: '86;89;120' #RTX 30xx + RTX 40xx + Blackwell (RTX 50xx, CC 12.0)
       cuda_arch_pascal:
         description: 'CUDA archs del build 12.x pre-Turing (ej. "61" = GTX 10xx)'
         default: '61' #GTX 10xx
@@ -45,7 +45,7 @@ concurrency:
 env:
   UPSTREAM_REPO: 0xShug0/audio.cpp
   UPSTREAM_REF: ${{ inputs.ref || 'main' }}
-  CUDA_ARCH: ${{ inputs.cuda_arch || '86' }}
+  CUDA_ARCH: ${{ inputs.cuda_arch || '86;89;120' }}
   CUDA_ARCH_PASCAL: ${{ inputs.cuda_arch_pascal || '61' }}
 
 jobs:
@@ -99,8 +99,9 @@ jobs:
     runs-on: ubuntu-24.04
     # Subir la minor de CUDA = cambiar SOLO este tag: la etiqueta 'cudaNN.N'
     # del asset se deriva del nvcc real del contenedor (paso "Derive CUDA
-    # label") y install.sh acepta cualquier 13.x.
-    container: nvidia/cuda:13.4.1-devel-ubuntu24.04   # misma imagen que usa llama.cpp
+    # label") y install.sh acepta cualquier 13.x. CTK >= 13.5 ya trae CCCL >= 3.5,
+    # así que este job no necesita el pin GGML_CUDA_CCCL_VERSION (solo el 12.x).
+    container: nvidia/cuda:13.5.0-devel-ubuntu24.04   # misma imagen que usa llama.cpp
 
     defaults:
       run:
@@ -167,7 +168,16 @@ jobs:
       #  ENGINE_ENABLE_NATIVE_CPU=OFF       sin -march=native del runner
       #  GGML_CUDA_FA_ALL_QUANTS=ON         FlashAttention para todas las cuantizaciones
       #       (compila bastante más lento y pesa más)
-      #  CMAKE_CUDA_ARCHITECTURES           explícito: el runner no tiene GPU
+      #  CMAKE_CUDA_ARCHITECTURES           explícito: el runner no tiene GPU.
+      #       86 = RTX 30xx · 89 = RTX 40xx (SASS nativo, sin JIT del PTX de sm86)
+      #       · 120 = Blackwell (CC 12.0: RTX 50xx, tu 5070 Ti). ggml reescribe el
+      #       12X pelado a 12Xa (external/ggml/src/ggml-cuda/CMakeLists.txt): las
+      #       instrucciones FP4/tensor cores de Blackwell NO son forward-compatible,
+      #       así que hace falta la variante 'a'. 90 (Hopper) se queda fuera: lo
+      #       cubre el PTX de compute_86. El nombre del asset sale de la cadena tal
+      #       cual ('sm86-89-120') y install.sh lo acepta con 'sm[^/]*'.
+      #       Cada arch añade su pasada completa de nvcc: con FA_ALL_QUANTS=ON el
+      #       build CUDA pasa de ~7 min (ccache caliente, 1 arch) a ~3x.
       # Diferencia respecto al PKGBUILD:
       #  GGML_CUDA_NCCL=OFF  en Arch no hay NCCL instalado, así que no se enlaza;
       #       este contenedor sí lo trae y acabaría como dependencia (solo sirve multi-GPU)
@@ -395,7 +405,7 @@ jobs:
           name: ${{ steps.pack.outputs.bin }}
           path: ${{ steps.pack.outputs.bin }}
           if-no-files-found: error
-      # Runtime CUDA (12.8): mismo empaquetado que el job 13.4.
+      # Runtime CUDA (12.8): mismo empaquetado que el job CUDA 13.x.
       - name: Stage CUDA runtime
         id: cudart
         run: |

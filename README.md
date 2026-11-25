@@ -1,7 +1,7 @@
 # builder
 
 Repositorio de builds para:
-- `audio.cpp` (Ubuntu x64 + CUDA 13.4 para Turing+, Ubuntu x64 + CUDA 12.8 para
+- `audio.cpp` (Ubuntu x64 + CUDA 13.x para Turing+ (incl. Blackwell), Ubuntu x64 + CUDA 12.8 para
   Maxwell/Pascal/Volta y Linux arm64 CPU, en una única release con los `tar.gz`
   correspondientes y un asset `cudart-<paquete>` por build CUDA con las librerías del
   runtime, el equivalente al de llama.cpp)
@@ -35,7 +35,7 @@ O descárgalo y ejecútalo localmente:
 El script instala todos los repos configurados de forma automática:
 
 1. Deduce el **perfil** de la máquina con `uname -m` (ver [Perfiles](#perfiles)); con el perfil
-   `cuda` además detecta la compute capability de la GPU con `nvidia-smi` y elige el asset CUDA (13.4 o 12.8).
+   `cuda` además detecta la compute capability de la GPU con `nvidia-smi` y elige la rama del asset CUDA (13.x o 12.8).
 2. Consulta la **última release** de cada repositorio vía la API de GitHub.
 3. Localiza el asset que coincide con el patrón configurado **para ese perfil y ese asset CUDA**.
 4. **Cachea** el archivo en `/tmp/` — si el SHA256 ya coincide, omite descarga y extracción.
@@ -65,22 +65,27 @@ El perfil sale de `uname -m`; con `--profile` se puede forzar.
 
 | `uname -m`        | Perfil  | Máquina                                              | llama.cpp                                  | audio.cpp                                  |
 |-------------------|---------|------------------------------------------------------|--------------------------------------------|--------------------------------------------|
-| `x86_64`          | `cuda`  | GPU NVIDIA Turing o superior (CC ≥ 8)                | `llama-bNNNN-bin-ubuntu-cuda-13.4-x64.tar.gz` | `audiocpp-<fecha>-bin-ubuntu-x64-cuda13.4-sm<arch>.tar.gz` |
+| `x86_64`          | `cuda`  | GPU NVIDIA Turing o superior (CC ≥ 8, incl. Blackwell / RTX 50xx) | `llama-bNNNN-bin-ubuntu-cuda-13.x-x64.tar.gz` | `audiocpp-<fecha>-bin-ubuntu-x64-cuda13.x-sm86-89-120.tar.gz` |
 | `x86_64`          | `cuda`  | GPU NVIDIA pre-Turing (CC ≤ 7.5, ej. GTX 10xx)       | `llama-bNNNN-bin-ubuntu-cuda-12.8-x64.tar.gz` | `audiocpp-<fecha>-bin-ubuntu-x64-cuda12.8-sm61.tar.gz` |
 | `aarch64`/`arm64` | `arm64` | Raspberry Pi y otros arm64 (solo CPU)                | `llama-bNNNN-bin-ubuntu-arm64.tar.gz`      | `audiocpp-<fecha>-bin-linux-arm64.tar.gz`  |
 
 Notas:
 
-- El perfil `cuda` asume una GPU NVIDIA. El asset 13.4 enlaza contra CUDA 13.x y el 12.8
+- El perfil `cuda` asume una GPU NVIDIA. El asset 13.x enlaza contra CUDA 13.x y el 12.8
   contra CUDA 12.x (`libcudart.so.NN`, `libcublas.so.NN`, `libcufft.so.NN`...): si el
   sistema no trae ese runtime, `install.sh` descarga el asset `cudart-...` de la misma
   release (llama.cpp y audio.cpp publican uno por build) y lo extrae junto al binario —
   `RUNPATH $ORIGIN` lo resuelve sin sudo ni variables de entorno.
 - CUDA 13 eliminó la compilación offline para Maxwell/Pascal/Volta: las GPUs pre-Turing las cubre
   el asset 12.8, elegido automáticamente vía `nvidia-smi --query-gpu=compute_cap`
-  (sin GPU detectada, por defecto 13.4).
-- Builds de audio.cpp: el de 13.4 compila `sm<arch>` (`sm86` = RTX 30xx por defecto) y el de
-  12.8, `sm61` (GTX 10xx); comprueba la arquitectura exacta en el nombre del asset.
+  (sin GPU detectada, por defecto la rama 13.x).
+- Builds de audio.cpp: el de 13.x compila `sm86;89;120` (`sm86` = RTX 30xx, `sm89` = RTX 40xx,
+  `sm120` = Blackwell / RTX 50xx; ggml convierte el `120` en `120a`, que es la variante con los
+  tensor cores de Blackwell) y el de 12.8, `sm61` (GTX 10xx); comprueba la arquitectura exacta en
+  el nombre del asset.
+- Blackwell (RTX 50xx, compute capability 12.0) pide driver NVIDIA ≥ 580 para el runtime CUDA 13.x
+  que traen los assets `cudart-...`. Un binario compilado solo para `sm86` arranca igualmente vía
+  JIT del PTX, pero recompila los kernels en el primer arranque y sin las rutas de Blackwell.
 - Si la release más reciente no trae el asset de tu perfil/asset CUDA, se usa la más reciente que sí lo tenga.
 - Los builds se compilan en Ubuntu 24.04 (glibc 2.39): en arm64 funcionan en Raspberry Pi OS **Trixie**
   y Ubuntu 24.04 o superior, no en Bookworm.
